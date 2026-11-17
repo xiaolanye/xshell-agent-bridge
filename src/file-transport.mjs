@@ -16,9 +16,10 @@ async function exists(path) {
 }
 
 async function atomicWriteJson(path, value) {
-  const temporary = `${path}.${process.pid}.${Date.now()}.tmp`;
-  await writeFile(temporary, `${JSON.stringify(value)}\n`, 'utf8');
-  await rename(temporary, path);
+  // Write in place instead of temp+rename: transparent-encryption agents on this
+  // host (DSE) append a 4 KiB cipher header on rename, and the Xshell-hosted
+  // Python reader cannot decrypt it. Direct writes stay readable on both sides.
+  await writeFile(path, `${JSON.stringify(value)}\n`, 'utf8');
 }
 
 export class FileBridgeTransport {
