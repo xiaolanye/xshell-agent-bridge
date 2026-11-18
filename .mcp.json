@@ -7,7 +7,8 @@
         "src/mcp-stdio.mjs"
       ],
       "env": {
-        "XSHELL_AGENT_ID": "claude"
+        "XSHELL_AGENT_ID": "claude",
+        "XSHELL_SAFETY_MODE": "safe"
       }
     }
   }
