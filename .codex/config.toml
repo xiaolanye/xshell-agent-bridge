@@ -7,3 +7,4 @@ default_tools_approval_mode = "writes"
 
 [mcp_servers.xshell.env]
 XSHELL_AGENT_ID = "codex"
+XSHELL_SAFETY_MODE = "safe"

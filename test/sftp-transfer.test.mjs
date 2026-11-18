@@ -93,7 +93,9 @@ test('creates an approved download plan without credentials', async (t) => {
   assert.equal(resolve(stateDir, started.transfer_id), resolve(specPath, '..'));
 });
 
-test('queues a credential-free desktop launch request for Xshell', async (t) => {
+test('queues a credential-free desktop launch request for Xshell', {
+  skip: process.platform !== 'win32' && 'The desktop launcher requires Windows.',
+}, async (t) => {
   const { root, downloadDir, stateDir, scriptPath, scpPath } = await fixture(t);
   const desktopLaunchDir = resolve(root, 'desktop-launch');
   const manager = new SftpDownloadManager({

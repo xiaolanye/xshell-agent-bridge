@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BridgeError, XshellBridgeCore } from '../src/core.mjs';
+import { BridgeError, SAFETY_MODES_PROTOCOL, XshellBridgeCore } from '../src/core.mjs';
 
 const approvalMetadata = {
   approvalMode: 'xshell-dialog-v1',
@@ -19,6 +19,72 @@ const interruptAction = () => ({
   explanation: 'Stop the test command.',
   expectedOutcome: 'The test command stops.',
   riskLevel: 'low',
+});
+
+test('applies each MCP safety mode independently in the same session queue', () => {
+  const core = new XshellBridgeCore();
+  core.register({
+    bridgeId: 'shared',
+    metadata: { ...approvalMetadata, safetyModesProtocol: SAFETY_MODES_PROTOCOL },
+  });
+  const dangerous = sendAction('rm ./discard-me');
+  assert.throws(() => core.submitJob('shared', { action: dangerous }), { code: 'DESTRUCTIVE_COMMAND_BLOCKED' });
+
+  const cases = [
+    [undefined, sendAction('pwd'), 'safe', true],
+    ['normal', sendAction('pwd'), 'normal', false],
+    ['normal', dangerous, 'normal', true],
+    ['normal', { ...sendAction('pwd'), riskLevel: 'high' }, 'normal', true],
+    ['normal', interruptAction(), 'normal', true],
+    ['full', sendAction('pwd'), 'full', false],
+    ['full', dangerous, 'full', false],
+    ['full', interruptAction(), 'full', false],
+  ];
+  for (const [safetyMode, action] of cases) {
+    core.submitJob('shared', { agentId: safetyMode ?? 'default', action, safetyMode });
+  }
+  for (const [, , mode, confirmationRequired] of cases) {
+    const job = core.nextJob('shared');
+    assert.equal(job.safetyMode, mode);
+    assert.equal(job.confirmationRequired, confirmationRequired);
+    core.completeJob('shared', job.id);
+  }
+});
+
+test('rejects invalid modes and requires capable scripts for normal and full', () => {
+  const core = new XshellBridgeCore();
+  core.register({ bridgeId: 'old', metadata: approvalMetadata });
+  const action = sendAction('pwd');
+  for (const safetyMode of ['normal', 'full']) {
+    assert.throws(() => core.submitJob('old', { action, safetyMode }), { code: 'SAFETY_MODE_UNAVAILABLE' });
+  }
+  for (const safetyMode of ['', null, 'typo']) {
+    assert.throws(() => core.submitJob('old', { action, safetyMode }), { code: 'INVALID_SAFETY_MODE' });
+  }
+
+  const legacyJob = core.submitJob('old', { action });
+  assert.equal(core.nextJob('old').id, legacyJob.id);
+});
+
+test('preserves credential checks and rejects reuse of a request ID under another mode', () => {
+  const core = new XshellBridgeCore();
+  core.register({
+    bridgeId: 'tab',
+    metadata: { ...approvalMetadata, safetyModesProtocol: SAFETY_MODES_PROTOCOL },
+  });
+  const action = sendAction('pwd');
+  const requestId = 'original-request';
+  core.submitJob('tab', { action, requestId, safetyMode: 'normal' });
+  assert.throws(
+    () => core.submitJob('tab', { action, requestId, safetyMode: 'full' }),
+    { code: 'IDEMPOTENCY_KEY_REUSED' },
+  );
+  for (const safetyMode of ['safe', 'normal', 'full']) {
+    assert.throws(
+      () => core.submitJob('tab', { action: sendAction('tool --password=placeholder'), safetyMode }),
+      { code: 'SENSITIVE_INPUT_BLOCKED' },
+    );
+  }
 });
 
 test('registers sessions and versions changed screens', () => {

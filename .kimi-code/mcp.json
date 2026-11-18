@@ -6,7 +6,8 @@
         "src/mcp-stdio.mjs"
       ],
       "env": {
-        "XSHELL_AGENT_ID": "kimi"
+        "XSHELL_AGENT_ID": "kimi",
+        "XSHELL_SAFETY_MODE": "safe"
       },
       "startupTimeoutMs": 10000,
       "toolTimeoutMs": 120000,

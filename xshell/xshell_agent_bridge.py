@@ -26,6 +26,7 @@ BRIDGE_ID = os.urandom(16).hex()
 PROTOCOL = "xshell-agent-file-v2"
 APPROVAL_MODE = "xshell-dialog-v1"
 COMMAND_POLICY_MODE = "agent-destructive-block-v1"
+SAFETY_MODES_PROTOCOL = "xshell-safety-modes-v1"
 RISK_LABELS = {
     "low": "低",
     "medium": "中",
@@ -201,6 +202,7 @@ def metadata():
         "columns": int(safe_value(lambda: xsh.Screen.Columns, 0) or 0),
         "approvalMode": APPROVAL_MODE,
         "commandPolicyMode": COMMAND_POLICY_MODE,
+        "safetyModesProtocol": SAFETY_MODES_PROTOCOL,
         "desktopLaunchMode": "xshell-startfile-v1",
     }
 
@@ -276,42 +278,59 @@ def hard_blocked_operation(text):
 
 def execute_job(job):
     action = job.get("action", {})
+    result = {"acceptedByXshell": False, "confirmationShown": False, "approvedByUser": False}
     try:
-        if action.get("type") == "send":
+        mode = job.get("safetyMode", "safe")
+        if mode not in ("safe", "normal", "full"):
+            raise RuntimeError("未知的终端安全模式，已拒绝执行。")
+        action_type = action.get("type")
+        if action_type not in ("send", "interrupt"):
+            raise RuntimeError("unsupported action: " + str(action_type))
+
+        blocked_category = None
+        if action_type == "send" and mode != "full":
             blocked_category = hard_blocked_operation(action.get("text", ""))
-            if blocked_category:
-                raise RuntimeError(
-                    "企业安全模式已硬性拦截 Agent 的“"
-                    + blocked_category
-                    + "”操作。该命令没有发送；如确有需要，请用户在 Xshell 中亲自输入。"
-                )
-        if not request_user_approval(job):
-            atomic_write_json(
-                RESULT_PATH,
-                {"jobId": job["id"], "job": job, "ok": False, "error": "用户在 Xshell 安全确认框中拒绝了该操作。"},
+        if mode == "safe" and blocked_category:
+            raise RuntimeError(
+                "企业安全模式已硬性拦截 Agent 的“"
+                + blocked_category
+                + "”操作。该命令没有发送；如确有需要，请用户在 Xshell 中亲自输入。"
             )
-            return
-        if action.get("type") == "send":
+
+        confirmation_required = mode == "safe" or (
+            mode == "normal" and (
+                job.get("confirmationRequired") is not False
+                or action_type == "interrupt"
+                or bool(blocked_category)
+                or action.get("riskLevel") in ("high", "critical")
+            )
+        )
+        if confirmation_required:
+            result["approvedByUser"] = request_user_approval(job)
+            result["confirmationShown"] = True
+            if not result["approvedByUser"]:
+                raise RuntimeError("用户在 Xshell 安全确认框中拒绝了该操作。")
+
+        if action_type == "send":
             xsh.Screen.Send(action.get("text", ""))
             if action.get("enter", False):
                 xsh.Screen.Send("\r")
-        elif action.get("type") == "interrupt":
-            xsh.Screen.Send(chr(3))
         else:
-            raise RuntimeError("unsupported action: " + str(action.get("type")))
+            xsh.Screen.Send(chr(3))
+        result["acceptedByXshell"] = True
         atomic_write_json(
             RESULT_PATH,
             {
                 "jobId": job["id"],
                 "job": job,
                 "ok": True,
-                "result": {"acceptedByXshell": True, "approvedByUser": True},
+                "result": result,
             },
         )
     except Exception as error:
         atomic_write_json(
             RESULT_PATH,
-            {"jobId": job["id"], "job": job, "ok": False, "error": str(error)},
+            {"jobId": job["id"], "job": job, "ok": False, "error": str(error), "result": result},
         )
 
 

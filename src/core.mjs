@@ -1,7 +1,9 @@
 import { randomUUID } from 'node:crypto';
+import { parseSafetyMode } from './safety-mode.mjs';
 
 export const REQUIRED_APPROVAL_MODE = 'xshell-dialog-v1';
 export const REQUIRED_COMMAND_POLICY_MODE = 'agent-destructive-block-v1';
+export const SAFETY_MODES_PROTOCOL = 'xshell-safety-modes-v1';
 const RISK_LEVELS = new Set(['low', 'medium', 'high', 'critical']);
 const SENSITIVE_PROMPT_PATTERN = /(?:password|passphrase|密码|口令|验证码|verification(?:\s+code)?|one[- ]time(?:\s+password)?|otp|pin|authentication\s+code|api\s*key|token)[^\r\n]{0,160}[:：?]\s*$/i;
 const SENSITIVE_INPUT_PATTERNS = [
@@ -101,6 +103,8 @@ function publicJob(job) {
     agentId: job.agentId,
     requestId: job.requestId,
     action: job.action,
+    safetyMode: job.safetyMode,
+    confirmationRequired: job.confirmationRequired,
     status: job.status,
     createdAt: job.createdAt,
     deliveredAt: job.deliveredAt,
@@ -202,7 +206,7 @@ export class XshellBridgeCore {
     };
   }
 
-  submitJob(id, { agentId = 'unknown-agent', requestId, action } = {}) {
+  submitJob(id, { agentId = 'unknown-agent', requestId, action, safetyMode } = {}) {
     const session = this.requireSession(id);
     if (!this.isOnline(session)) {
       throw new BridgeError('The Xshell bridge is offline or stale.', 409, 'SESSION_OFFLINE');
@@ -221,9 +225,24 @@ export class XshellBridgeCore {
         'COMMAND_POLICY_UNAVAILABLE',
       );
     }
+    safetyMode = this.validateSafetyMode(safetyMode);
+    if (!this.supportsSafetyMode(session, safetyMode)) {
+      throw new BridgeError('当前 Xshell 标签页只支持 safe。请重新运行新版 Xshell 桥接脚本。', 409, 'SAFETY_MODE_UNAVAILABLE');
+    }
     this.validateAction(action);
+    let confirmationRequired = safetyMode !== 'full';
     if (action.type === 'send') {
-      this.validateHardBlockedInput(action.text);
+      const category = safetyMode === 'full' ? null : findBlockedOperation(action.text);
+      if (safetyMode === 'safe' && category) {
+        throw new BridgeError(
+          `企业安全模式已禁止 Agent 执行“${category}”操作。即使用户愿意确认，桥接程序也不会发送；如确有需要，请用户在 Xshell 中亲自输入。`,
+          403,
+          'DESTRUCTIVE_COMMAND_BLOCKED',
+        );
+      }
+      if (safetyMode === 'normal') {
+        confirmationRequired = Boolean(category) || ['high', 'critical'].includes(action.riskLevel);
+      }
       this.validateSensitiveInput(session, action.text);
     }
     const normalizedAgentId = String(agentId).slice(0, 128);
@@ -232,8 +251,8 @@ export class XshellBridgeCore {
     if (idempotencyKey) {
       const existing = this.idempotencyKeys.get(idempotencyKey);
       if (existing) {
-        if (existing.actionJson !== JSON.stringify(action)) {
-          throw new BridgeError('requestId was already used for a different action.', 409, 'IDEMPOTENCY_KEY_REUSED');
+        if (existing.actionJson !== JSON.stringify(action) || existing.safetyMode !== safetyMode) {
+          throw new BridgeError('requestId was already used for a different action or safety mode.', 409, 'IDEMPOTENCY_KEY_REUSED');
         }
         const existingJob = this.jobs.get(existing.jobId);
         if (existingJob) return publicJob(existingJob);
@@ -247,6 +266,8 @@ export class XshellBridgeCore {
       agentId: normalizedAgentId,
       requestId: normalizedRequestId,
       action: structuredClone(action),
+      safetyMode,
+      confirmationRequired,
       status: 'queued',
       createdAt: now,
       deliveredAt: null,
@@ -255,7 +276,7 @@ export class XshellBridgeCore {
       error: null,
     };
     this.jobs.set(job.id, job);
-    if (idempotencyKey) this.idempotencyKeys.set(idempotencyKey, { jobId: job.id, actionJson: JSON.stringify(action) });
+    if (idempotencyKey) this.idempotencyKeys.set(idempotencyKey, { jobId: job.id, actionJson: JSON.stringify(action), safetyMode });
     session.queue.push(job.id);
     this.audit({ type: 'job.queued', ...auditJob(job) });
     return publicJob(job);
@@ -270,6 +291,13 @@ export class XshellBridgeCore {
     while (session.queue.length > 0) {
       const job = this.jobs.get(session.queue.shift());
       if (!job || job.status !== 'queued') continue;
+      if (!this.supportsSafetyMode(session, job.safetyMode)) {
+        job.status = 'failed';
+        job.completedAt = this.now();
+        job.error = 'Xshell 桥接脚本已不支持请求的安全模式，未发送输入。';
+        this.audit({ type: 'job.failed', ...auditJob(job) });
+        continue;
+      }
       job.status = 'delivered';
       job.deliveredAt = this.now();
       session.activeJobId = job.id;
@@ -290,7 +318,7 @@ export class XshellBridgeCore {
     }
     job.status = ok ? 'completed' : 'failed';
     job.completedAt = this.now();
-    job.result = ok ? result : null;
+    job.result = result;
     job.error = ok ? null : String(error || 'Xshell bridge action failed.');
     if (session.activeJobId === job.id) session.activeJobId = null;
     this.audit({ type: ok ? 'job.completed' : 'job.failed', ...auditJob(job) });
@@ -305,12 +333,15 @@ export class XshellBridgeCore {
     if (this.jobs.has(snapshot.id)) return publicJob(this.jobs.get(snapshot.id));
     this.validateAction(snapshot.action);
     const requestId = this.validateRequestId(snapshot.requestId);
+    const safetyMode = this.validateSafetyMode(snapshot.safetyMode);
     const job = {
       id: snapshot.id,
       sessionId: id,
       agentId: String(snapshot.agentId || 'recovered-agent').slice(0, 128),
       requestId,
       action: structuredClone(snapshot.action),
+      safetyMode,
+      confirmationRequired: snapshot.confirmationRequired ?? true,
       status: 'delivered',
       createdAt: Number(snapshot.createdAt) || this.now(),
       deliveredAt: Number(snapshot.deliveredAt) || this.now(),
@@ -323,6 +354,7 @@ export class XshellBridgeCore {
       this.idempotencyKeys.set(`${id}\u0000${job.agentId}\u0000${requestId}`, {
         jobId: job.id,
         actionJson: JSON.stringify(snapshot.action),
+        safetyMode,
       });
     }
     session.activeJobId = job.id;
@@ -472,13 +504,15 @@ export class XshellBridgeCore {
     }
   }
 
-  validateHardBlockedInput(text) {
-    const category = findBlockedOperation(text);
-    if (!category) return;
-    throw new BridgeError(
-      `企业安全模式已禁止 Agent 执行“${category}”操作。即使用户愿意确认，桥接程序也不会发送；如确有需要，请用户在 Xshell 中亲自输入。`,
-      403,
-      'DESTRUCTIVE_COMMAND_BLOCKED',
-    );
+  validateSafetyMode(value) {
+    try {
+      return parseSafetyMode(value);
+    } catch (error) {
+      throw new BridgeError(error.message, 400, 'INVALID_SAFETY_MODE');
+    }
+  }
+
+  supportsSafetyMode(session, safetyMode) {
+    return safetyMode === 'safe' || session.metadata.safetyModesProtocol === SAFETY_MODES_PROTOCOL;
   }
 }

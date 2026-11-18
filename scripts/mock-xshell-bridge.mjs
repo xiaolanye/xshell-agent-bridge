@@ -1,5 +1,6 @@
 import { randomUUID } from 'node:crypto';
 import { connectToDaemon } from '../src/client.mjs';
+import { REQUIRED_APPROVAL_MODE, REQUIRED_COMMAND_POLICY_MODE, SAFETY_MODES_PROTOCOL } from '../src/core.mjs';
 
 const client = await connectToDaemon();
 const id = `mock-${randomUUID()}`;
@@ -19,7 +20,9 @@ await bridgeRequest('/bridge/register', {
       remotePort: 22,
       rows: 24,
       columns: 80,
-      approvalMode: 'xshell-dialog-v1',
+      approvalMode: REQUIRED_APPROVAL_MODE,
+      commandPolicyMode: REQUIRED_COMMAND_POLICY_MODE,
+      safetyModesProtocol: SAFETY_MODES_PROTOCOL,
     },
     screen,
   },
