@@ -24,6 +24,16 @@ CONFIG = load_config()
 POLL_MS = int(CONFIG.get("bridge", {}).get("pollIntervalMs", 250))
 # 屏幕抓取比心跳更贵（整屏 Get + JSON 序列化），单独限频，默认 1 秒一次。
 SCREEN_INTERVAL_MS = int(CONFIG.get("bridge", {}).get("screenIntervalMs", 1000))
+# 发送输入后短暂等待，让回显和首批输出落到屏幕上，再抓图回写状态。
+SETTLE_MS = int(CONFIG.get("bridge", {}).get("settleAfterSendMs", 250))
+# 命令结束后等提示符重新出现，确认输出已经落屏（0 表示关闭该行为）。
+WAIT_PROMPT_MS = int(CONFIG.get("bridge", {}).get("waitForPromptMs", 2000))
+PROMPT_POLL_MS = int(CONFIG.get("bridge", {}).get("promptPollMs", 120))
+# 优雅停止：批处理写入该文件后，脚本自行退出，避免 Xshell 强杀脚本线程。
+STOP_PATH = os.path.join(PROJECT_ROOT, "data", "stop-bridge")
+# 只响应“启动之后”写入的停止信号，这样多个标签页的脚本都能同时退出，
+# 且残留的旧信号不会阻止下一次启动。
+STARTED_AT = time.time()
 BRIDGE_ID = os.urandom(16).hex()
 PROTOCOL = "xshell-agent-file-v2"
 APPROVAL_MODE = "xshell-dialog-v1"
@@ -221,6 +231,52 @@ def capture_screen():
     return str(xsh.Screen.Get(1, 1, rows, columns))
 
 
+def invalidate_screen_cache():
+    """命令执行后强制下次重新抓屏，避免把执行前的旧屏幕写进状态。"""
+    global CACHED_AT
+    CACHED_AT = 0.0
+
+
+def last_nonempty_line(text):
+    for line in reversed(str(text).replace("\r", "").split("\n")):
+        if line.strip():
+            return line
+    return ""
+
+
+def wait_for_prompt(pre_text, timeout_ms, poll_ms):
+    """只在"最后一行与发送前的提示符完全一致"时判定命令结束。
+
+    刻意采取最保守的判据：不按 #/$/> 这类符号猜测，也不做容错匹配。
+    原因是 mysql/sqlplus/redis 等交互式客户端的提示符会随状态变化
+    （mysql> / '> / -> / SQL> / 127.0.0.1:6379>），而命令输出里也可能
+    出现以 # $ > 结尾的行；任何"宽松匹配"都可能把没结束的命令当成结束，
+    进而让下一条命令被注入仍在运行的进程。
+
+    代价：交互式客户端与改变提示符的命令（cd/su/ssh）一律等超时，
+    由客户端据 promptDetected=False 自行轮询。
+    """
+    pre_prompt = last_nonempty_line(pre_text).strip()
+    if not pre_prompt:
+        return False
+    deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
+    echo_seen = False
+    while time.monotonic() < deadline:
+        try:
+            xsh.Session.Sleep(poll_ms)
+        except Exception:
+            return False
+        current = capture_screen()
+        if not echo_seen:
+            # 发送瞬间屏幕还没变，最后一行仍是旧提示符，先等回显出现
+            if current != pre_text:
+                echo_seen = True
+            continue
+        if last_nonempty_line(current).strip() == pre_prompt:
+            return True
+    return False
+
+
 def throttled_screen():
     """限频抓屏：两次抓取之间复用上次结果，避免每轮都整屏 Get。"""
     global CACHED_SCREEN, CACHED_AT
@@ -338,6 +394,7 @@ def execute_job(job):
             if not result["approvedByUser"]:
                 raise RuntimeError("用户在 Xshell 安全确认框中拒绝了该操作。")
 
+        pre_screen = capture_screen()
         if action_type == "send":
             xsh.Screen.Send(action.get("text", ""))
             if action.get("enter", False):
@@ -345,6 +402,23 @@ def execute_job(job):
         else:
             xsh.Screen.Send(chr(3))
         result["acceptedByXshell"] = True
+        # 给回显和首批输出一点时间落到屏幕上，再让主循环抓新图。
+        if SETTLE_MS > 0:
+            try:
+                xsh.Session.Sleep(SETTLE_MS)
+            except Exception:
+                pass
+        # 等命令真正结束（提示符回来）再写结果：客户端收到 completed 时，
+        # 屏幕里已经是最终输出，不必再补一次 read_screen。
+        # promptDetected=False 表示等到超时也没看到提示符，命令可能仍在执行，
+        # 客户端必须据此决定是继续等还是先打断，不能直接发下一条。
+        detected = True
+        if WAIT_PROMPT_MS > 0 and (action_type == "interrupt" or action.get("enter", False)):
+            wait_started = time.monotonic()
+            detected = wait_for_prompt(pre_screen, WAIT_PROMPT_MS, PROMPT_POLL_MS)
+            result["waitedMs"] = int((time.monotonic() - wait_started) * 1000)
+        result["promptDetected"] = detected
+        invalidate_screen_cache()
         atomic_write_json(
             RESULT_PATH,
             {
@@ -446,13 +520,34 @@ def process_desktop_launch_requests():
                 pass
 
 
-def Main():
+def sleep_or_exit(milliseconds):
+    """会话关闭后 xsh.Session 已不可用，Sleep 会抛 TypeError。
+
+    返回 False 表示会话已结束，主循环应当退出，而不是继续抛异常。
+    """
+    try:
+        sleep = getattr(xsh.Session, "Sleep", None)
+        if not callable(sleep):
+            return False
+        sleep(milliseconds)
+        return True
+    except Exception:
+        return False
+
+
+def _main_loop():
     xsh.Screen.Synchronous = True
     os.makedirs(SESSION_DIR, exist_ok=True)
     os.makedirs(DESKTOP_LAUNCH_ROOT, exist_ok=True)
     write_state()
 
     while True:
+        # 收到停止信号就自己退出，避免 Xshell 强杀脚本线程导致原生崩溃。
+        try:
+            if os.path.exists(STOP_PATH) and os.path.getmtime(STOP_PATH) >= STARTED_AT:
+                break
+        except OSError:
+            pass
         try:
             write_state()
         except Exception as error:
@@ -473,4 +568,17 @@ def Main():
                 write_state()
         except Exception as error:
             record_loop_error("command_dispatch", error)
-        xsh.Session.Sleep(POLL_MS)
+        if not sleep_or_exit(POLL_MS):
+            break
+
+
+def Main():
+    """Xshell 的脚本入口。收尾阶段（关窗口/断连）的异常要吞掉，
+    否则 Xshell 会弹出 Traceback 对话框。"""
+    try:
+        _main_loop()
+    except Exception as error:
+        try:
+            record_loop_error("main", error)
+        except Exception:
+            pass
