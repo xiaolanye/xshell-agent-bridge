@@ -60,7 +60,7 @@ function validateConfig(config) {
   requireInteger(config.safety.completedJobRetentionMs, 'safety.completedJobRetentionMs', 3_600_000, 2_592_000_000);
   requireInteger(config.safety.sessionRetentionMs, 'safety.sessionRetentionMs', 3_600_000, 7_776_000_000);
   requireInteger(config.safety.runtimeDataRetentionMs, 'safety.runtimeDataRetentionMs', 86_400_000, 31_536_000_000);
-  requireInteger(config.bridge.pollIntervalMs, 'bridge.pollIntervalMs', 50, 250);
+  requireInteger(config.bridge.pollIntervalMs, 'bridge.pollIntervalMs', 50, 5000);
   return config;
 }
 

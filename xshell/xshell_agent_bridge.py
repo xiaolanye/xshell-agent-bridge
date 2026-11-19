@@ -22,6 +22,8 @@ def load_config():
 
 CONFIG = load_config()
 POLL_MS = int(CONFIG.get("bridge", {}).get("pollIntervalMs", 250))
+# 屏幕抓取比心跳更贵（整屏 Get + JSON 序列化），单独限频，默认 1 秒一次。
+SCREEN_INTERVAL_MS = int(CONFIG.get("bridge", {}).get("screenIntervalMs", 1000))
 BRIDGE_ID = os.urandom(16).hex()
 PROTOCOL = "xshell-agent-file-v2"
 APPROVAL_MODE = "xshell-dialog-v1"
@@ -45,6 +47,10 @@ RESULT_PATH = os.path.join(SESSION_DIR, "result.json")
 LOOP_ERROR_PATH = os.path.join(SESSION_DIR, "bridge-error.json")
 LAST_STATE = None
 LAST_TOUCH_AT = 0.0
+LAST_SCREEN = None
+LAST_META = None
+CACHED_SCREEN = None
+CACHED_AT = 0.0
 HARD_BLOCKED_INPUT_PATTERNS = (
     (
         "文件删除或内容清空",
@@ -215,23 +221,44 @@ def capture_screen():
     return str(xsh.Screen.Get(1, 1, rows, columns))
 
 
+def throttled_screen():
+    """限频抓屏：两次抓取之间复用上次结果，避免每轮都整屏 Get。"""
+    global CACHED_SCREEN, CACHED_AT
+    now = time.monotonic()
+    if CACHED_SCREEN is not None and (now - CACHED_AT) * 1000.0 < SCREEN_INTERVAL_MS:
+        return CACHED_SCREEN
+    CACHED_SCREEN = capture_screen()
+    CACHED_AT = now
+    return CACHED_SCREEN
+
+
 def write_state():
-    global LAST_STATE, LAST_TOUCH_AT
+    global LAST_STATE, LAST_TOUCH_AT, LAST_SCREEN, LAST_META
+    screen = throttled_screen()
+    meta = metadata()
+    now = time.monotonic()
+    if screen == LAST_SCREEN and meta == LAST_META and os.path.exists(STATE_PATH):
+        # 内容未变：只刷新修改时间当心跳，跳过整份 JSON 序列化与写盘
+        if now - LAST_TOUCH_AT >= 1.0:
+            try:
+                os.utime(STATE_PATH, None)
+            except OSError:
+                pass
+            LAST_TOUCH_AT = now
+        return
     state = {
         "protocol": PROTOCOL,
         "sessionId": BRIDGE_ID,
-        "metadata": metadata(),
-        "screen": capture_screen(),
+        "metadata": meta,
+        "screen": screen,
     }
     serialized = json.dumps(state, ensure_ascii=False, sort_keys=True)
-    now = time.monotonic()
     if serialized != LAST_STATE or not os.path.exists(STATE_PATH):
         atomic_write_json(STATE_PATH, state)
         LAST_STATE = serialized
         LAST_TOUCH_AT = now
-    elif now - LAST_TOUCH_AT >= 1.0:
-        os.utime(STATE_PATH, None)
-        LAST_TOUCH_AT = now
+    LAST_SCREEN = screen
+    LAST_META = meta
 
 
 def approval_message(job):
