@@ -1,5 +1,5 @@
 import { timingSafeEqual } from 'node:crypto';
-import { appendFile, mkdir } from 'node:fs/promises';
+import { appendFile, mkdir, rm, stat, writeFile } from 'node:fs/promises';
 import { createServer } from 'node:http';
 import { resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -7,6 +7,40 @@ import { BridgeError, XshellBridgeCore } from './core.mjs';
 import { DATA_DIR, loadConfig } from './config.mjs';
 import { FileBridgeTransport } from './file-transport.mjs';
 import { cleanRuntimeData } from './runtime-retention.mjs';
+
+async function requestFreshScreen(sessionId, timeoutMs = 1_500) {
+  // 空闲时脚本不再周期抓屏，这里写一个 screen.request 让它按需抓一次，
+  // 等 state.json 更新（说明画面已刷新）再返回，避免读到旧画面。
+  const directory = resolve(DATA_DIR, 'ipc', sessionId);
+  const statePath = resolve(directory, 'state.json');
+  const requestPath = resolve(directory, 'screen.request');
+  let before = 0;
+  try {
+    before = (await stat(statePath)).mtimeMs;
+  } catch {
+    // 还没有 state.json，等待它出现即可
+  }
+  try {
+    await writeFile(requestPath, 'refresh\n', 'utf8');
+  } catch {
+    return false;
+  }
+  const deadline = Date.now() + timeoutMs;
+  while (Date.now() < deadline) {
+    await new Promise((resolveDelay) => setTimeout(resolveDelay, 50));
+    try {
+      if ((await stat(statePath)).mtimeMs > before) {
+        // 脚本已写出新状态；再等一拍让文件传输把它读进内存，避免读到旧画面。
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 300));
+        return true;
+      }
+    } catch {
+      // 继续等
+    }
+  }
+  rm(requestPath, { force: true }).catch(() => {});
+  return false;
+}
 
 function sendJson(response, statusCode, value) {
   const body = JSON.stringify(value);
@@ -136,7 +170,9 @@ export async function createDaemon({ config: providedConfig, listen = true } = {
 
       const screenRoute = url.pathname.match(/^\/v1\/sessions\/([^/]+)\/screen$/);
       if (request.method === 'GET' && screenRoute) {
-        sendJson(response, 200, core.getScreen(decodeURIComponent(screenRoute[1])));
+        const screenSessionId = decodeURIComponent(screenRoute[1]);
+        await requestFreshScreen(screenSessionId);
+        sendJson(response, 200, core.getScreen(screenSessionId));
         return;
       }
 

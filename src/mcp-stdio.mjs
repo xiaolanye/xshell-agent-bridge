@@ -14,6 +14,7 @@ const SEND_POLICY = {
   full: 'full 模式下，终端输入跳过危险命令检查和 Xshell 本地弹窗，发送前仍须获得用户对操作的明确授权。',
 }[SAFETY_MODE];
 const INTERRUPT_POLICY = SAFETY_MODE === 'full' ? '直接发送 Ctrl+C。' : 'Xshell 会弹窗确认 Ctrl+C。';
+const RESULT_POLICY = '发送后最多等待 3 秒，观察 shell 提示符是否回到屏幕。返回的 promptDetected=false 表示没等到，命令可能仍在执行，必须先用 xshell_read_screen 或 xshell_wait_for 复核，不要直接发送下一条。判据基于屏幕文本，存在误报可能：如果命令输出恰好打印出与提示符同形的一行（相同前缀且以 # $ > 结尾），可能被提前判为结束，请结合本次命令的输出自行判断，有疑问就读屏复核。尽量使用非交互式命令（mysql -e "..."、sqlplus -S 配合 here-doc 并在末尾 exit、redis-cli 单条命令），这类命令能稳定地在结束后立即返回；若必须进入 mysql> / SQL> / redis-cli 交互会话，请预期每条命令都要等到超时后再由你主动轮询结果。';
 const PROTOCOL_VERSION = '2025-06-18';
 const downloadManager = new SftpDownloadManager();
 const uploadManager = new SftpUploadManager();
@@ -47,7 +48,7 @@ const tools = [
   {
     name: 'xshell_send',
     title: '申请向 Xshell 发送输入',
-    description: `申请发送精确终端输入。调用前必须向用户解释本步骤。${SEND_POLICY}密码、口令、验证码、Token、API Key 等敏感信息必须由用户亲自输入。`,
+    description: `申请发送精确终端输入。调用前必须向用户解释本步骤。${SEND_POLICY}${RESULT_POLICY}密码、口令、验证码、Token、API Key 等敏感信息必须由用户亲自输入。`,
     inputSchema: {
       type: 'object',
       required: ['text', 'explanation', 'expected_outcome', 'risk_level'],

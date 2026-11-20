@@ -27,7 +27,7 @@ SCREEN_INTERVAL_MS = int(CONFIG.get("bridge", {}).get("screenIntervalMs", 1000))
 # 发送输入后短暂等待，让回显和首批输出落到屏幕上，再抓图回写状态。
 SETTLE_MS = int(CONFIG.get("bridge", {}).get("settleAfterSendMs", 250))
 # 命令结束后等提示符重新出现，确认输出已经落屏（0 表示关闭该行为）。
-WAIT_PROMPT_MS = int(CONFIG.get("bridge", {}).get("waitForPromptMs", 2000))
+WAIT_PROMPT_MS = int(CONFIG.get("bridge", {}).get("waitForPromptMs", 3000))
 PROMPT_POLL_MS = int(CONFIG.get("bridge", {}).get("promptPollMs", 120))
 # 优雅停止：批处理写入该文件后，脚本自行退出，避免 Xshell 强杀脚本线程。
 STOP_PATH = os.path.join(PROJECT_ROOT, "data", "stop-bridge")
@@ -209,6 +209,7 @@ def safe_value(getter, default=None):
 
 
 def metadata():
+    note_step("metadata")
     return {
         "connected": bool(safe_value(lambda: xsh.Session.Connected, False)),
         "remoteAddress": str(safe_value(lambda: xsh.Session.RemoteAddress, "")),
@@ -223,7 +224,38 @@ def metadata():
     }
 
 
+META_CACHE = {"value": None, "at": 0.0}
+META_TTL_S = 3.0
+# 空闲降频：连续 IDLE_AFTER_S 秒没有任务后，把轮询和抓屏都放慢，
+# 尽量把"挂机时对 Xshell 原生接口的调用"压到接近零。
+IDLE_AFTER_S = int(CONFIG.get("bridge", {}).get("idleAfterSeconds", 60))
+IDLE_POLL_MS = int(CONFIG.get("bridge", {}).get("idlePollMs", 2000))
+IDLE_SCREEN_MS = int(CONFIG.get("bridge", {}).get("idleScreenMs", 10000))
+LAST_ACTIVITY_AT = time.monotonic()
+
+
+def is_idle():
+    return (time.monotonic() - LAST_ACTIVITY_AT) >= IDLE_AFTER_S
+
+
+def cached_metadata(ttl_s=None):
+    """元数据变化很慢，缓存几秒再读。
+
+    空闲时这是循环里最重的部分：250ms 轮询意味着每秒 24 次原生属性访问
+    （Connected / RemoteAddress / RemotePort / Path / Rows / Columns），
+    挂机一整夜就是几十万次跨进程调用，是 Xshell 长时间运行后崩溃的
+    主要嫌疑之一。缓存后降到每秒不到 1 次。
+    """
+    limit = META_TTL_S if ttl_s is None else ttl_s
+    now = time.monotonic()
+    if META_CACHE["value"] is None or now - META_CACHE["at"] >= limit:
+        META_CACHE["value"] = metadata()
+        META_CACHE["at"] = now
+    return META_CACHE["value"]
+
+
 def capture_screen():
+    note_step("screen.get")
     rows = int(safe_value(lambda: xsh.Screen.Rows, 0) or 0)
     columns = int(safe_value(lambda: xsh.Screen.Columns, 0) or 0)
     if rows < 1 or columns < 1:
@@ -244,20 +276,38 @@ def last_nonempty_line(text):
     return ""
 
 
+TAIL_END_RE = re.compile(r"[#$>]\s*$")
+
+
+def prompt_anchor(prompt):
+    """从发送前的提示符里取出稳定前缀，用来判断提示符是否回来了。
+
+    root@host:/path#  -> root@host      （cd 换目录后仍然匹配）
+    [root@host ~]#    -> [root@host
+    mysql>            -> mysql>         （'>  / ->  / SQL> 都对不上）
+    """
+    text = str(prompt or "").strip()
+    if not text:
+        return ""
+    if ":" in text:
+        return text.split(":", 1)[0].strip()
+    parts = text.split()
+    return parts[0] if parts else text
+
+
 def wait_for_prompt(pre_text, timeout_ms, poll_ms):
-    """只在"最后一行与发送前的提示符完全一致"时判定命令结束。
+    """判断命令是否结束：提示符以相同前缀回来，且以 # $ > 结尾。
 
-    刻意采取最保守的判据：不按 #/$/> 这类符号猜测，也不做容错匹配。
-    原因是 mysql/sqlplus/redis 等交互式客户端的提示符会随状态变化
-    （mysql> / '> / -> / SQL> / 127.0.0.1:6379>），而命令输出里也可能
-    出现以 # $ > 结尾的行；任何"宽松匹配"都可能把没结束的命令当成结束，
-    进而让下一条命令被注入仍在运行的进程。
+    比逐字符相等宽松（cd/su 之后路径变了也能识别），但仍要求前缀一致，
+    避免 mysql 的 '> / -> / SQL> 这类状态提示符被当成"命令结束"。
 
-    代价：交互式客户端与改变提示符的命令（cd/su/ssh）一律等超时，
-    由客户端据 promptDetected=False 自行轮询。
+    屏幕判据终究是文本匹配，仍有误判可能（例如命令输出恰好打印出与
+    提示符同形的文本），因此结果里同时给出 promptDetected，
+    由调用方自行判断是否需要复核。
     """
     pre_prompt = last_nonempty_line(pre_text).strip()
-    if not pre_prompt:
+    anchor = prompt_anchor(pre_prompt)
+    if not anchor:
         return False
     deadline = time.monotonic() + max(0, timeout_ms) / 1000.0
     echo_seen = False
@@ -272,28 +322,61 @@ def wait_for_prompt(pre_text, timeout_ms, poll_ms):
             if current != pre_text:
                 echo_seen = True
             continue
-        if last_nonempty_line(current).strip() == pre_prompt:
+        tail = last_nonempty_line(current).strip()
+        if tail.startswith(anchor) and TAIL_END_RE.search(tail):
             return True
     return False
 
 
-def throttled_screen():
+def throttled_screen(interval_ms=None):
     """限频抓屏：两次抓取之间复用上次结果，避免每轮都整屏 Get。"""
     global CACHED_SCREEN, CACHED_AT
+    limit = SCREEN_INTERVAL_MS if interval_ms is None else interval_ms
     now = time.monotonic()
-    if CACHED_SCREEN is not None and (now - CACHED_AT) * 1000.0 < SCREEN_INTERVAL_MS:
+    if CACHED_SCREEN is not None and (now - CACHED_AT) * 1000.0 < limit:
         return CACHED_SCREEN
     CACHED_SCREEN = capture_screen()
     CACHED_AT = now
     return CACHED_SCREEN
 
 
+SCREEN_REQUEST_PATH = os.path.join(SESSION_DIR, "screen.request")
+FORCE_STATE = {"flag": False}
+
+
+def handle_screen_request():
+    """外部（网关/守护进程）请求刷新画面时，抓一次屏并更新缓存。
+
+    空闲时脚本不主动抓屏，读屏一律走这个按需通道，避免挂机时的周期调用。
+    """
+    global CACHED_SCREEN, CACHED_AT
+    try:
+        if not os.path.exists(SCREEN_REQUEST_PATH):
+            return False
+    except OSError:
+        return False
+    try:
+        os.remove(SCREEN_REQUEST_PATH)
+    except OSError:
+        pass
+    CACHED_SCREEN = capture_screen()
+    CACHED_AT = time.monotonic()
+    FORCE_STATE["flag"] = True
+    return True
+
+
 def write_state():
     global LAST_STATE, LAST_TOUCH_AT, LAST_SCREEN, LAST_META
-    screen = throttled_screen()
-    meta = metadata()
+    if is_idle():
+        # 空闲时完全不碰 Xshell 原生接口：沿用上次结果，只维护心跳。
+        # 需要新画面时由外部写 screen.request，由 handle_screen_request() 触发一次抓取。
+        screen = CACHED_SCREEN if CACHED_SCREEN is not None else ""
+        meta = META_CACHE["value"] if META_CACHE["value"] is not None else cached_metadata(10.0)
+    else:
+        screen = throttled_screen(SCREEN_INTERVAL_MS)
+        meta = cached_metadata(META_TTL_S)
     now = time.monotonic()
-    if screen == LAST_SCREEN and meta == LAST_META and os.path.exists(STATE_PATH):
+    if (not FORCE_STATE["flag"]) and screen == LAST_SCREEN and meta == LAST_META and os.path.exists(STATE_PATH):
         # 内容未变：只刷新修改时间当心跳，跳过整份 JSON 序列化与写盘
         if now - LAST_TOUCH_AT >= 1.0:
             try:
@@ -309,12 +392,14 @@ def write_state():
         "screen": screen,
     }
     serialized = json.dumps(state, ensure_ascii=False, sort_keys=True)
-    if serialized != LAST_STATE or not os.path.exists(STATE_PATH):
+    forced = FORCE_STATE["flag"]
+    if forced or serialized != LAST_STATE or not os.path.exists(STATE_PATH):
         atomic_write_json(STATE_PATH, state)
         LAST_STATE = serialized
         LAST_TOUCH_AT = now
     LAST_SCREEN = screen
     LAST_META = meta
+    FORCE_STATE["flag"] = False
 
 
 def approval_message(job):
@@ -529,25 +614,58 @@ def sleep_or_exit(milliseconds):
         sleep = getattr(xsh.Session, "Sleep", None)
         if not callable(sleep):
             return False
+        note_step("sleep")
         sleep(milliseconds)
         return True
     except Exception:
         return False
 
 
+STEP_PATH = os.path.join(PROJECT_ROOT, "data", "last-step.txt")
+LAST_STEP = {"name": None, "at": 0.0}
+LOOP_COUNT = {"n": 0}
+
+
+def note_step(name):
+    """崩溃面包屑：记录当前正在调用哪个原生接口。
+
+    Xshell 是原生进程，脚本宿主崩溃时 Python 的 try/except 没有机会执行，
+    只能靠事先写到磁盘的标记推断死在哪一步。最多每秒写一次，避免自身开销。
+    """
+    now = time.monotonic()
+    if LAST_STEP["name"] == name and now - LAST_STEP["at"] < 1.0:
+        return
+    LAST_STEP["name"] = name
+    LAST_STEP["at"] = now
+    try:
+        with open(STEP_PATH, "w", encoding="utf-8") as handle:
+            handle.write("%s loop=%d step=%s\n" % (
+                time.strftime("%Y-%m-%d %H:%M:%S"), LOOP_COUNT["n"], name))
+    except Exception:
+        pass
+
+
 def _main_loop():
+    global LAST_ACTIVITY_AT
     xsh.Screen.Synchronous = True
     os.makedirs(SESSION_DIR, exist_ok=True)
     os.makedirs(DESKTOP_LAUNCH_ROOT, exist_ok=True)
     write_state()
 
     while True:
-        # 收到停止信号就自己退出，避免 Xshell 强杀脚本线程导致原生崩溃。
+        LOOP_COUNT["n"] += 1
+        # 停止信号每 40 轮检查一次（约 10 秒）即可：E: 盘挂了加密驱动，
+        # 每次 stat 都要过驱动，能少一次就少一次。
+        if LOOP_COUNT["n"] % 40 == 1:
+            try:
+                if os.path.exists(STOP_PATH) and os.path.getmtime(STOP_PATH) >= STARTED_AT:
+                    break
+            except OSError:
+                pass
         try:
-            if os.path.exists(STOP_PATH) and os.path.getmtime(STOP_PATH) >= STARTED_AT:
-                break
-        except OSError:
-            pass
+            handle_screen_request()
+        except Exception as error:
+            record_loop_error("screen_request", error)
         try:
             write_state()
         except Exception as error:
@@ -564,11 +682,13 @@ def _main_loop():
             if os.path.exists(COMMAND_PATH) and not os.path.exists(ACTIVE_PATH):
                 # Claim before execution. An uncertain input is never replayed after a crash.
                 os.replace(COMMAND_PATH, ACTIVE_PATH)
+                LAST_ACTIVITY_AT = time.monotonic()
                 execute_job(read_json(ACTIVE_PATH))
+                LAST_ACTIVITY_AT = time.monotonic()
                 write_state()
         except Exception as error:
             record_loop_error("command_dispatch", error)
-        if not sleep_or_exit(POLL_MS):
+        if not sleep_or_exit(IDLE_POLL_MS if is_idle() else POLL_MS):
             break
 
 
