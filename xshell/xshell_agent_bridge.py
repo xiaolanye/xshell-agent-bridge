@@ -402,11 +402,50 @@ def write_state():
     FORCE_STATE["flag"] = False
 
 
-def approval_message(job):
+def _collect_review(job, analysis):
+    """弹窗展示用的命中信息：优先用网关算好的结果，缺失再本地重算。"""
+    review = job.get("safetyReview") or {}
+    findings = list(review.get("findings") or [])
+    auto = list(review.get("autoApproved") or [])
+    if not findings and analysis:
+        findings = list(analysis.get("findings") or [])
+    if not auto and analysis:
+        auto = list(analysis.get("autoApproved") or [])
+    return findings, auto
+
+
+def _highlight_spans(text, findings):
+    """把命中片段用【】圈出来。MessageBox 不支持富文本，只能靠符号突出。"""
+    spans = []
+    for finding in findings:
+        raw = str(finding.get("match") or "")
+        if not raw:
+            continue
+        index = finding.get("index")
+        start = index if isinstance(index, int) and index >= 0 and text[index:index + len(raw)] == raw else -1
+        if start < 0:
+            start = text.find(raw)
+        if start < 0:
+            continue
+        spans.append((start, start + len(raw)))
+    spans.sort(reverse=True)
+    last_start = None
+    for start, end in spans:
+        if last_start is not None and end > last_start:
+            continue  # 与已标记片段重叠，跳过以免嵌套
+        text = text[:start] + "【" + text[start:end] + "】" + text[end:]
+        last_start = start
+    return text
+
+
+def approval_message(job, analysis=None):
     action = job.get("action", {})
+    findings, auto = _collect_review(job, analysis)
     if action.get("type") == "send":
         operation = "发送终端输入" + ("并按回车" if action.get("enter", False) else "（不按回车）")
-        exact_input = json.dumps(str(action.get("text", "")), ensure_ascii=False)
+        raw_input = str(action.get("text", ""))
+        marked = _highlight_spans(raw_input, findings) if findings else raw_input
+        exact_input = json.dumps(marked, ensure_ascii=False)
         for codepoint in range(0x202A, 0x202F):
             exact_input = exact_input.replace(chr(codepoint), "\\u" + format(codepoint, "04x"))
         for codepoint in range(0x2066, 0x206A):
@@ -415,33 +454,397 @@ def approval_message(job):
         operation = "发送 Ctrl+C 中断当前命令"
         exact_input = "Ctrl+C"
     remote_address = str(metadata().get("remoteAddress") or "未知主机")
+
+    header = ["AI Agent 请求执行一个终端操作。", ""]
+    if findings:
+        header.append("⚠ 需要你重点确认：" + str(len(findings)) + " 处")
+        header.append("────────────────────────────")
+        for order, finding in enumerate(findings[:6], 1):
+            header.append(str(order) + ") 规则：" + str(finding.get("category")))
+            header.append("   片段：" + str(finding.get("match") or "")[:160])
+            reason = str(finding.get("reason") or "")
+            if reason:
+                header.append("   原因：" + reason)
+        if len(findings) > 6:
+            header.append("…… 另有 " + str(len(findings) - 6) + " 处命中")
+        header.append("────────────────────────────")
+        if auto:
+            header.append("另有 " + str(len(auto)) + " 处命令替换已解析为只读，未计入上表。")
+        header.append("其余命令部分未命中规则，可跳过不看。")
+        header.append("")
+    elif auto:
+        header.append("命令含 " + str(len(auto)) + " 处命令替换，已解析：内部均为只读命令。")
+        header.append("")
+
+    rules_line = ""
+    if findings:
+        names = []
+        for finding in findings:
+            name = str(finding.get("category"))
+            if name not in names:
+                names.append(name)
+        rules_line = "命中规则：" + "、".join(names) + "\n\n"
+
+    # MessageBox 高度有限，超长命令会被截掉底部按钮；命中片段已在顶部单列，
+    # 这里只保证能看个大概。
+    shown_input = exact_input
+    if len(shown_input) > 2000:
+        shown_input = shown_input[:2000] + "…（已截断，原文共 %d 字符）" % len(exact_input)
+
     return (
-        "AI Agent 请求执行一个终端操作。\n\n"
-        "目标主机：" + remote_address + "\n"
+        "\n".join(header) + "\n"
+        + "目标主机：" + remote_address + "\n"
         "Agent：" + str(job.get("agentId", "unknown-agent")) + "\n"
         "操作：" + operation + "\n"
         "风险等级：" + RISK_LABELS.get(str(action.get("riskLevel", "")), "未说明") + "\n\n"
         "为什么要做：\n" + str(action.get("explanation", "")) + "\n\n"
         "预期结果：\n" + str(action.get("expectedOutcome", "")) + "\n\n"
-        "将要发送的完整内容（引号内为输入，反斜杠表示转义字符）：\n---\n" + exact_input + "\n---\n\n"
-        "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。"
+        "完整命令（【】内为需要你确认的片段，反斜杠表示转义字符）：\n---\n" + shown_input + "\n---\n\n"
+        + rules_line
+        + "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。"
     )
 
 
-def request_user_approval(job):
+def request_user_approval(job, analysis=None):
     try:
         # Xshell MessageBox nType=4 displays Yes/No; return value 6 means Yes.
-        return int(xsh.Dialog.MessageBox(approval_message(job), "Xshell Agent Bridge 安全确认", 4)) == 6
+        return int(xsh.Dialog.MessageBox(approval_message(job, analysis), "Xshell Agent Bridge 安全确认", 4)) == 6
     except Exception as error:
         raise RuntimeError("无法显示 Xshell 安全确认框，已拒绝执行：" + str(error))
 
 
-def hard_blocked_operation(text):
+# ---------------------------------------------------------------------------
+# 命令体检：解析 $( ) 与反引号内部内容，只读的自动放行，其余交人工确认。
+# 规则必须与 src/core.mjs 的 analyzeCommand 保持一致，否则会出现网关放行、
+# 脚本又弹窗（或反之）的不一致。
+# ---------------------------------------------------------------------------
+
+READONLY_COMMANDS = frozenset((
+    "cat", "head", "tail", "grep", "egrep", "fgrep", "awk", "gawk", "sed", "cut", "tr",
+    "sort", "uniq", "wc", "ls", "df", "du", "free", "ps", "pgrep", "pidof",
+    "pwd", "whoami", "id", "uname", "date", "stat", "readlink", "realpath",
+    "basename", "dirname", "echo", "printf", "test", "expr", "true", "false", "seq",
+    "column", "lsblk", "lscpu", "nproc", "uptime", "which", "type", "printenv", "find",
+))
+
+# 会把这些只读工具变成写操作参数。
+WRITE_FLAGS = {
+    "sort": re.compile(r"(?:^|\s)(?:-o|--output)(?:\s|=|$)"),
+    "date": re.compile(r"(?:^|\s)(?:-s|--set)(?:\s|=|$)"),
+    "sed": re.compile(r"(?:^|\s)-i|--in-place"),
+    "find": re.compile(r"(?:^|\s)(?:-delete|-exec|-execdir|-ok|-okdir|-fprint\w*|-fls)\b"),
+    "awk": re.compile(r"system\s*\(|print\s*\|"),
+    "gawk": re.compile(r"system\s*\(|print\s*\|"),
+    "ls": re.compile(r"(?:^|\s)--?R\b"),
+}
+
+# 文本级解释器检测（保留原有两条规则）；命令替换那条改由结构解析处理。
+INTERPRETER_PATTERNS = DYNAMIC_EXECUTION_PATTERNS[:2]
+DYNAMIC_ONLY_PATTERNS = (
+    ("动态变量或命令替换执行", re.compile(r"(?:^|[\r\n;&|]\s*)(?:eval|source)\b", re.I)),
+    ("动态变量或命令替换执行", re.compile(r"(?:^|[\r\n;&|]\s*)\.\s+", re.I)),
+)
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_SUBST_HEAD_RE = re.compile(r"^_{9,}")
+_VAR_HEAD_RE = re.compile(r"^\$\{?[A-Za-z_]")
+
+
+def _split_shell_segments(text):
+    """按 ; & | 换行切段，跳过引号内与转义字符。"""
+    segments = []
+    buffer = ""
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if ch == "\\":
+            buffer += text[i:i + 2]
+            i += 2
+            continue
+        if in_single:
+            buffer += ch
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            buffer += ch
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            buffer += ch
+            i += 1
+            continue
+        if not in_double and ch in ";&|\n":
+            segments.append(buffer)
+            buffer = ""
+            while i < length and text[i] in ";&|\n":
+                i += 1
+            continue
+        buffer += ch
+        i += 1
+    if buffer.strip():
+        segments.append(buffer)
+    return segments
+
+
+def _first_command(tokens):
+    """跳过前导 VAR=value 赋值，返回 (命令名, 参数串, 位置)。"""
+    index = 0
+    while index < len(tokens) and _ASSIGN_RE.match(tokens[index]):
+        index += 1
+    if index >= len(tokens):
+        return None, "", index
+    name = tokens[index].split("/")[-1].strip("\"'").lower()
+    return name, " ".join(tokens[index + 1:]), index
+
+
+def _is_readonly_pipeline(inner):
+    cleaned = re.sub(r"\d?>&\d", " ", str(inner or "")).replace("&>", " ")
+    if re.search(r">>?", cleaned):
+        return False
+    segments = _split_shell_segments(cleaned)
+    if not segments:
+        return False
+    for segment in segments:
+        tokens = segment.strip().split()
+        if not tokens:
+            continue
+        name, args, _ = _first_command(tokens)
+        if name is None:
+            continue
+        if name not in READONLY_COMMANDS:
+            return False
+        flag = WRITE_FLAGS.get(name)
+        if flag and flag.search(args):
+            return False
+    return True
+
+
+def _extract_substitutions(text):
+    """找出所有 $(...) 与 `...`，处理嵌套、引号与转义。"""
+    found = []
+    i = 0
+    length = len(text)
+    in_single = False
+    in_double = False
+    while i < length:
+        ch = text[i]
+        if ch == "\\":
+            i += 2
+            continue
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            i += 1
+            continue
+        if ch == '"' and not in_single:
+            in_double = not in_double
+            i += 1
+            continue
+        if ch == "$" and i + 1 < length and text[i + 1] == "(":
+            start = i
+            depth = 1
+            j = i + 2
+            single = False
+            double = False
+            while j < length and depth > 0:
+                inner_ch = text[j]
+                if inner_ch == "\\":
+                    j += 2
+                    continue
+                if single:
+                    if inner_ch == "'":
+                        single = False
+                    j += 1
+                    continue
+                if inner_ch == "'" and not double:
+                    single = True
+                    j += 1
+                    continue
+                if inner_ch == '"' and not single:
+                    double = not double
+                    j += 1
+                    continue
+                if inner_ch == "(":
+                    depth += 1
+                elif inner_ch == ")":
+                    depth -= 1
+                j += 1
+            end = j if depth == 0 else length
+            found.append({
+                "kind": "command",
+                "raw": text[start:end],
+                "inner": text[start + 2:max(start + 2, end - 1)],
+                "index": start,
+            })
+            i = end
+            continue
+        if ch == "`":
+            start = i
+            j = i + 1
+            while j < length:
+                if text[j] == "\\":
+                    j += 2
+                    continue
+                if text[j] == "`":
+                    break
+                j += 1
+            end = min(j + 1, length)
+            found.append({
+                "kind": "backtick",
+                "raw": text[start:end],
+                "inner": text[start + 1:j],
+                "index": start,
+            })
+            i = end
+            continue
+        i += 1
+    return found
+
+
+def _describe_reject(inner):
+    for segment in _split_shell_segments(str(inner or "")):
+        tokens = segment.strip().split()
+        if not tokens:
+            continue
+        name, args, _ = _first_command(tokens)
+        if name is None:
+            continue
+        if name not in READONLY_COMMANDS:
+            return "内部命令 “%s” 不在只读白名单内" % name
+        flag = WRITE_FLAGS.get(name)
+        if flag and flag.search(args):
+            return "内部 %s 带了会写文件的参数" % name
+    if re.search(r">>?", re.sub(r"\d?>&\d", " ", str(inner or ""))):
+        return "内部有输出重定向，会写文件"
+    return "内部结构无法静态确认"
+
+
+def analyze_command(text):
+    """返回 {category, findings, substitutions, autoApproved}。"""
     normalized = re.sub(r"\\\r?\n", " ", str(text or ""))
-    for category, pattern in HARD_BLOCKED_INPUT_PATTERNS + DYNAMIC_EXECUTION_PATTERNS:
-        if pattern.search(normalized):
-            return category
-    return None
+    findings = []
+
+    for category, pattern in HARD_BLOCKED_INPUT_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            findings.append({
+                "tier": "hard", "category": category, "match": match.group(0),
+                "index": match.start(), "reason": "命中高危命令特征",
+            })
+
+    for category, pattern in INTERPRETER_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            findings.append({
+                "tier": "dynamic", "category": category, "match": match.group(0)[:200],
+                "index": match.start(), "reason": "命中把内容交给解释器执行的写法",
+            })
+
+    substitutions = []
+    for entry in _extract_substitutions(normalized):
+        nested = analyze_command(entry["inner"])
+        nested_hard = next((f for f in nested["findings"] if f["tier"] == "hard"), None)
+        item = dict(entry)
+        if nested_hard:
+            base = nested_hard["category"].replace("（命令替换内部）", "")
+            item["verdict"] = "blocked"
+            item["nested_category"] = base
+            item["reason"] = "命令替换内部命中高危规则：" + base
+        elif not _is_readonly_pipeline(entry["inner"]):
+            item["verdict"] = "blocked"
+            item["reason"] = _describe_reject(entry["inner"])
+        else:
+            item["verdict"] = "readonly"
+            item["reason"] = "内部仅调用只读命令"
+        substitutions.append(item)
+
+    for item in substitutions:
+        if item["verdict"] != "blocked":
+            continue
+        base = item.get("nested_category")
+        findings.append({
+            "tier": "hard" if base else "dynamic",
+            "category": (base + "（命令替换内部）") if base else "动态变量或命令替换执行",
+            "match": item["raw"],
+            "index": item["index"],
+            "reason": item["reason"],
+        })
+
+    # 命令位置检查：替换结果或变量被直接当作命令执行时，实际命令静态不可知。
+    masked = normalized
+    for item in sorted(substitutions, key=lambda x: x["index"], reverse=True):
+        placeholder = "_" * max(9, len(item["raw"]))
+        masked = masked[:item["index"]] + placeholder + masked[item["index"] + len(item["raw"]):]
+    cursor = 0
+    for segment in _split_shell_segments(masked):
+        segment_start = masked.find(segment, cursor)
+        if segment_start >= 0:
+            cursor = segment_start + len(segment)
+        segment_start = max(0, segment_start)
+        tokens = segment.strip().split()
+        if not tokens:
+            continue
+        name, _args, index = _first_command(tokens)
+        if name is None or index >= len(tokens):
+            continue
+        head = tokens[index].strip("\"'")
+        covered = any(
+            item["verdict"] == "blocked" and abs(item["index"] - segment_start) <= 2
+            for item in substitutions
+        )
+        if _SUBST_HEAD_RE.match(head):
+            if not covered:
+                findings.append({
+                    "tier": "dynamic", "category": "动态变量或命令替换执行",
+                    "match": "$( ... )", "index": segment_start,
+                    "reason": "命令替换的结果被直接当作命令执行",
+                })
+        elif _VAR_HEAD_RE.match(head):
+            findings.append({
+                "tier": "dynamic", "category": "动态变量或命令替换执行",
+                "match": head[:120], "index": segment_start,
+                "reason": "变量被当作命令执行，真正执行的命令静态不可知",
+            })
+
+    for category, pattern in DYNAMIC_ONLY_PATTERNS:
+        match = pattern.search(normalized)
+        if match:
+            findings.append({
+                "tier": "dynamic", "category": category, "match": match.group(0),
+                "index": match.start(), "reason": "命中 eval/source 或点号执行",
+            })
+
+    findings.sort(key=lambda f: f["index"])
+    seen = set()
+    unique = []
+    for finding in findings:
+        key = (finding["tier"], finding["category"], finding["index"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(finding)
+
+    hard = next((f for f in unique if f["tier"] == "hard"), None)
+    return {
+        "category": hard["category"] if hard else (unique[0]["category"] if unique else None),
+        "findings": unique,
+        "substitutions": substitutions,
+        "autoApproved": [s for s in substitutions if s["verdict"] == "readonly"],
+    }
+
+
+def hard_blocked_operation(text):
+    return analyze_command(text)["category"]
 
 
 def execute_job(job):
@@ -455,9 +858,13 @@ def execute_job(job):
         if action_type not in ("send", "interrupt"):
             raise RuntimeError("unsupported action: " + str(action_type))
 
+        analysis = None
         blocked_category = None
-        if action_type == "send" and mode != "full":
-            blocked_category = hard_blocked_operation(action.get("text", ""))
+        if action_type == "send":
+            # 本地再算一遍，既用于 safe 模式硬拦截，也给弹窗提供命中详情。
+            analysis = analyze_command(action.get("text", ""))
+            if mode != "full":
+                blocked_category = analysis["category"]
         if mode == "safe" and blocked_category:
             raise RuntimeError(
                 "企业安全模式已硬性拦截 Agent 的“"
@@ -474,7 +881,7 @@ def execute_job(job):
             )
         )
         if confirmation_required:
-            result["approvedByUser"] = request_user_approval(job)
+            result["approvedByUser"] = request_user_approval(job, analysis)
             result["confirmationShown"] = True
             if not result["approvedByUser"]:
                 raise RuntimeError("用户在 Xshell 安全确认框中拒绝了该操作。")

@@ -78,13 +78,395 @@ const DYNAMIC_EXECUTION_PATTERNS = [
   },
 ];
 
+// Commands that only read remote state. A command substitution built purely
+// from these cannot change anything on the remote host, so it does not need a
+// user decision. Anything else inside $( ) or ` ` still does.
+const READONLY_COMMANDS = new Set([
+  'cat', 'head', 'tail', 'grep', 'egrep', 'fgrep', 'awk', 'gawk', 'sed', 'cut', 'tr',
+  'sort', 'uniq', 'wc', 'ls', 'df', 'du', 'free', 'ps', 'pgrep', 'pidof',
+  'pwd', 'whoami', 'id', 'uname', 'date', 'stat', 'readlink', 'realpath',
+  'basename', 'dirname', 'echo', 'printf', 'test', 'expr', 'true', 'false', 'seq',
+  'column', 'lsblk', 'lscpu', 'nproc', 'uptime', 'which', 'type', 'printenv', 'find',
+]);
+
+// Flags that turn an otherwise read-only tool into a writer.
+const WRITE_FLAGS = new Map([
+  ['sort', /(?:^|\s)(?:-o|--output)(?:\s|=|$)/],
+  ['date', /(?:^|\s)(?:-s|--set)(?:\s|=|$)/],
+  ['sed', /(?:^|\s)-i|--in-place/],
+  ['find', /(?:^|\s)(?:-delete|-exec|-execdir|-ok|-okdir|-fprint\w*|-fls)\b/],
+  ['awk', /system\s*\(|print\s*\|/],
+  ['gawk', /system\s*\(|print\s*\|/],
+  ['ls', /(?:^|\s)--?R\b/],
+]);
+
+// Text that appears in a substitution before a pipeline split, used to keep
+// "eval" and "source" out of the read-only path.
+const DYNAMIC_ONLY_PATTERNS = [
+  {
+    category: '动态变量或命令替换执行',
+    pattern: /(?:^|[\r\n;&|]\s*)(?:eval|source)\b/i,
+  },
+  {
+    category: '动态变量或命令替换执行',
+    pattern: /(?:^|[\r\n;&|]\s*)\.\s+/i,
+  },
+];
+
+// Split on shell command separators while ignoring quoted text, so that
+// `pgrep -f "a|b"` is not mistaken for a pipeline.
+function splitShellSegments(text) {
+  const segments = [];
+  let buffer = '';
+  let inSingle = false;
+  let inDouble = false;
+  let i = 0;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\') {
+      buffer += text.slice(i, i + 2);
+      i += 2;
+      continue;
+    }
+    if (inSingle) {
+      buffer += ch;
+      if (ch === "'") inSingle = false;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
+      buffer += ch;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      buffer += ch;
+      i += 1;
+      continue;
+    }
+    if (!inDouble && (ch === ';' || ch === '\n' || ch === '|' || ch === '&')) {
+      segments.push(buffer);
+      buffer = '';
+      while (i < text.length && ';|&\n'.includes(text[i])) i += 1;
+      continue;
+    }
+    buffer += ch;
+    i += 1;
+  }
+  if (buffer.trim()) segments.push(buffer);
+  return segments;
+}
+
+function isReadOnlyPipeline(inner) {
+  const cleaned = String(inner || '')
+    .replace(/\d?>&\d/g, ' ')
+    .replace(/&>/g, ' ');
+  // Any output redirection can write to disk, even inside a substitution.
+  if (/>>?/.test(cleaned)) return false;
+  const segments = splitShellSegments(cleaned);
+  if (!segments.length) return false;
+  for (const segment of segments) {
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    if (!tokens.length) continue;
+    let index = 0;
+    while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+    if (index >= tokens.length) continue; // pure assignment, nothing executed
+    const command = tokens[index].replace(/^.*\//, '').replace(/^["']|["']$/g, '').toLowerCase();
+    if (!READONLY_COMMANDS.has(command)) return false;
+    const args = tokens.slice(index + 1).join(' ');
+    const forbidden = WRITE_FLAGS.get(command);
+    if (forbidden && forbidden.test(args)) return false;
+  }
+  return true;
+}
+
+// Locate every $(...) and `...` in a command, skipping escaped quotes the way
+// a POSIX shell would. Nesting is handled by depth counting.
+function extractSubstitutions(text) {
+  const found = [];
+  let i = 0;
+  let inSingle = false;
+  let inDouble = false;
+  while (i < text.length) {
+    const ch = text[i];
+    if (ch === '\\') {
+      i += 2;
+      continue;
+    }
+    if (inSingle) {
+      if (ch === "'") inSingle = false;
+      i += 1;
+      continue;
+    }
+    if (ch === "'" && !inDouble) {
+      inSingle = true;
+      i += 1;
+      continue;
+    }
+    if (ch === '"' && !inSingle) {
+      inDouble = !inDouble;
+      i += 1;
+      continue;
+    }
+    if (ch === '$' && text[i + 1] === '(') {
+      const start = i;
+      let depth = 1;
+      let j = i + 2;
+      let single = false;
+      let double = false;
+      while (j < text.length && depth > 0) {
+        const inner = text[j];
+        if (inner === '\\') {
+          j += 2;
+          continue;
+        }
+        if (single) {
+          if (inner === "'") single = false;
+          j += 1;
+          continue;
+        }
+        if (inner === "'" && !double) {
+          single = true;
+          j += 1;
+          continue;
+        }
+        if (inner === '"' && !single) {
+          double = !double;
+          j += 1;
+          continue;
+        }
+        if (inner === '(') depth += 1;
+        else if (inner === ')') depth -= 1;
+        j += 1;
+      }
+      const end = depth === 0 ? j : text.length;
+      found.push({
+        kind: 'command',
+        raw: text.slice(start, end),
+        inner: text.slice(start + 2, Math.max(start + 2, end - 1)),
+        index: start,
+      });
+      i = end;
+      continue;
+    }
+    if (ch === '`') {
+      const start = i;
+      let j = i + 1;
+      while (j < text.length) {
+        if (text[j] === '\\') {
+          j += 2;
+          continue;
+        }
+        if (text[j] === '`') break;
+        j += 1;
+      }
+      const end = Math.min(j + 1, text.length);
+      found.push({
+        kind: 'backtick',
+        raw: text.slice(start, end),
+        inner: text.slice(start + 1, j),
+        index: start,
+      });
+      i = end;
+      continue;
+    }
+    i += 1;
+  }
+  return found;
+}
+
+// Text-level interpreter checks from DYNAMIC_EXECUTION_PATTERNS. The command
+// substitution entry (index 2) is handled structurally by analyzeCommand
+// instead of by a bare "did we see $( or a backtick" regex.
+const INTERPRETER_PATTERNS = DYNAMIC_EXECUTION_PATTERNS.slice(0, 2);
+
+function describeSubstitutionReject(inner) {
+  const segments = splitShellSegments(String(inner || ''));
+  for (const segment of segments) {
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    let index = 0;
+    while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+    if (index >= tokens.length) continue;
+    const command = tokens[index].replace(/^.*\//, '').toLowerCase();
+    if (!READONLY_COMMANDS.has(command)) {
+      return '内部命令 “' + command + '” 不在只读白名单内';
+    }
+    const args = tokens.slice(index + 1).join(' ');
+    const forbidden = WRITE_FLAGS.get(command);
+    if (forbidden && forbidden.test(args)) return '内部 ' + command + ' 带了会写文件的参数';
+  }
+  if (/>>?/.test(String(inner || '').replace(/\d?>&\d/g, ' '))) return '内部有输出重定向，会写文件';
+  return '内部结构无法静态确认';
+}
+
+const SUBST_PLACEHOLDER = '__SUBST__';
+
+// Replace every substitution with a same-length placeholder so the word
+// structure survives: "P=$(x)" is still an assignment, but "$(x) -rf /" shows
+// up as a placeholder sitting in command position.
+function maskSubstitutions(text, substitutions) {
+  let masked = text;
+  const ordered = [...substitutions].sort((a, b) => b.index - a.index);
+  for (const entry of ordered) {
+    const placeholder = '_'.repeat(Math.max(9, entry.raw.length));
+    masked = masked.slice(0, entry.index) + placeholder + masked.slice(entry.index + entry.raw.length);
+  }
+  return masked;
+}
+
+function findCommandPositionRisks(maskedText) {
+  const risks = [];
+  let cursor = 0;
+  for (const segment of splitShellSegments(maskedText)) {
+    const segmentStart = maskedText.indexOf(segment, cursor);
+    if (segmentStart >= 0) cursor = segmentStart + segment.length;
+    const tokens = segment.trim().split(/\s+/).filter(Boolean);
+    let index = 0;
+    while (index < tokens.length && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[index])) index += 1;
+    if (index >= tokens.length) continue;
+    const head = tokens[index].replace(/^["']|["']$/g, '');
+    if (/^_{9,}/.test(head)) {
+      risks.push({
+        index: Math.max(0, segmentStart),
+        match: '$( ... )',
+        reason: '命令替换的结果被直接当作命令执行',
+      });
+    } else if (/^\$\{?[A-Za-z_]/.test(head)) {
+      risks.push({
+        index: Math.max(0, segmentStart),
+        match: head.slice(0, 120),
+        reason: '变量被当作命令执行，真正执行的命令静态不可知',
+      });
+    }
+  }
+  return risks;
+}
+
+export function analyzeCommand(text) {
+  const raw = String(text || '');
+  const normalized = raw.replace(/\\\r?\n/g, ' ');
+  const findings = [];
+
+  for (const { category, pattern } of HARD_BLOCKED_INPUT_PATTERNS) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      findings.push({ tier: 'hard', category, match: match[0], index: match.index, reason: '命中高危命令特征' });
+    }
+  }
+
+  for (const { category, pattern } of INTERPRETER_PATTERNS) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      findings.push({
+        tier: 'dynamic',
+        category,
+        match: match[0].slice(0, 200),
+        index: match.index,
+        reason: '命中把内容交给解释器执行的写法',
+      });
+    }
+  }
+
+  const substitutions = extractSubstitutions(normalized).map((entry) => {
+    const nested = analyzeCommand(entry.inner);
+    const nestedHard = nested.findings.find((finding) => finding.tier === 'hard');
+    if (nestedHard) {
+      // Strip any suffix the recursive call added; the outer call adds it once.
+      const base = String(nestedHard.category).replace(/（命令替换内部）/g, '');
+      return {
+        ...entry,
+        verdict: 'blocked',
+        nestedCategory: base,
+        reason: '命令替换内部命中高危规则：' + base,
+      };
+    }
+    if (!isReadOnlyPipeline(entry.inner)) {
+      return { ...entry, verdict: 'blocked', reason: describeSubstitutionReject(entry.inner) };
+    }
+    return { ...entry, verdict: 'readonly', reason: '内部仅调用只读命令' };
+  });
+
+  for (const substitution of substitutions) {
+    if (substitution.verdict !== 'blocked') continue;
+    findings.push({
+      tier: substitution.nestedCategory ? 'hard' : 'dynamic',
+      category: substitution.nestedCategory
+        ? substitution.nestedCategory + '（命令替换内部）'
+        : '动态变量或命令替换执行',
+      match: substitution.raw,
+      index: substitution.index,
+      reason: substitution.reason,
+    });
+  }
+
+  const masked = maskSubstitutions(normalized, substitutions);
+  for (const risk of findCommandPositionRisks(masked)) {
+    const alreadyCovered = substitutions.some(
+      (entry) => entry.verdict === 'blocked' && Math.abs(entry.index - risk.index) <= 2,
+    );
+    if (alreadyCovered) continue;
+    findings.push({
+      tier: 'dynamic',
+      category: '动态变量或命令替换执行',
+      match: risk.match,
+      index: risk.index,
+      reason: risk.reason,
+    });
+  }
+
+  for (const { category, pattern } of DYNAMIC_ONLY_PATTERNS) {
+    const match = pattern.exec(normalized);
+    if (match) {
+      findings.push({ tier: 'dynamic', category, match: match[0], index: match.index, reason: '命中 eval/source 或点号执行' });
+    }
+  }
+
+  findings.sort((a, b) => a.index - b.index);
+  const seen = new Set();
+  const unique = findings.filter((finding) => {
+    const key = finding.tier + '\u0000' + finding.category + '\u0000' + finding.index;
+    if (seen.has(key)) return false;
+    seen.add(key);
+    return true;
+  });
+
+  const hard = unique.find((finding) => finding.tier === 'hard');
+  const category = hard ? hard.category : (unique[0]?.category || null);
+
+  return {
+    category,
+    findings: unique,
+    substitutions,
+    // Substitutions that were parsed, proven read-only, and are allowed to run
+    // without a prompt. Kept so the dialog can show what was auto-cleared.
+    autoApproved: substitutions.filter((entry) => entry.verdict === 'readonly'),
+  };
+}
+
 function findBlockedOperation(text) {
-  const normalized = String(text || '').replace(/\\\r?\n/g, ' ');
-  return (
-    HARD_BLOCKED_INPUT_PATTERNS.find(({ pattern }) => pattern.test(normalized))?.category
-    || DYNAMIC_EXECUTION_PATTERNS.find(({ pattern }) => pattern.test(normalized))?.category
-    || null
-  );
+  return analyzeCommand(text).category;
+}
+
+function buildSafetyReview(analysis) {
+  if (!analysis) return null;
+  if (!analysis.findings.length && !analysis.autoApproved.length) return null;
+  return {
+    category: analysis.category,
+    findings: analysis.findings.slice(0, 5).map((finding) => ({
+      tier: finding.tier,
+      category: finding.category,
+      match: String(finding.match || '').slice(0, 240),
+      index: finding.index,
+      reason: finding.reason,
+    })),
+    autoApproved: analysis.autoApproved.slice(0, 5).map((entry) => ({
+      match: String(entry.raw || '').slice(0, 240),
+      index: entry.index,
+      reason: entry.reason,
+    })),
+  };
 }
 
 export class BridgeError extends Error {
@@ -105,6 +487,7 @@ function publicJob(job) {
     action: job.action,
     safetyMode: job.safetyMode,
     confirmationRequired: job.confirmationRequired,
+    safetyReview: job.safetyReview || null,
     status: job.status,
     createdAt: job.createdAt,
     deliveredAt: job.deliveredAt,
@@ -231,8 +614,11 @@ export class XshellBridgeCore {
     }
     this.validateAction(action);
     let confirmationRequired = safetyMode !== 'full';
+    let safetyReview = null;
     if (action.type === 'send') {
-      const category = safetyMode === 'full' ? null : findBlockedOperation(action.text);
+      const analysis = safetyMode === 'full' ? null : analyzeCommand(action.text);
+      const category = analysis?.category || null;
+      safetyReview = buildSafetyReview(analysis);
       if (safetyMode === 'safe' && category) {
         throw new BridgeError(
           `企业安全模式已禁止 Agent 执行“${category}”操作。即使用户愿意确认，桥接程序也不会发送；如确有需要，请用户在 Xshell 中亲自输入。`,
@@ -241,6 +627,8 @@ export class XshellBridgeCore {
         );
       }
       if (safetyMode === 'normal') {
+        // A substitution whose body was parsed and proven read-only no longer
+        // forces a prompt; only real findings do.
         confirmationRequired = Boolean(category) || ['high', 'critical'].includes(action.riskLevel);
       }
       this.validateSensitiveInput(session, action.text);
@@ -268,6 +656,7 @@ export class XshellBridgeCore {
       action: structuredClone(action),
       safetyMode,
       confirmationRequired,
+      safetyReview,
       status: 'queued',
       createdAt: now,
       deliveredAt: null,

