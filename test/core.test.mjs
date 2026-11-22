@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
+import { readFileSync } from 'node:fs';
 import { analyzeCommand, BridgeError, buildSafetyReview, SAFETY_MODES_PROTOCOL, XshellBridgeCore } from '../src/core.mjs';
 
 const approvalMetadata = {
@@ -534,4 +535,11 @@ test('keeps the full safety review and points command-position hits at the real 
   const finding = positioned.findings.find((entry) => entry.reason.includes('当作命令'));
   assert.equal(finding.match, '$(echo chmod)');
   assert.equal('sudo $(echo chmod) 777 /etc/shadow'.slice(finding.index, finding.index + finding.match.length), finding.match);
+});
+
+test('matches the shared normal confirmation cases', () => {
+  const cases = JSON.parse(readFileSync(new URL('./normal-confirmation.json', import.meta.url), 'utf8'));
+  for (const text of cases.allow) assert.equal(analyzeCommand(text).category, null, text);
+  for (const text of cases.review) assert.ok(analyzeCommand(text).category, text);
+  assert.equal(analyzeCommand('rm one two; cat /unrelated').findings[0].target, 'one、two');
 });

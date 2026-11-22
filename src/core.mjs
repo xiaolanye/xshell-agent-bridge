@@ -69,7 +69,8 @@ function auditJob(job) {
         expectedOutcomeLength: job.action?.expectedOutcome?.length,
         riskLevel: job.action?.riskLevel,
       };
-  return { ...publicJob(job), action };
+  const { safetyReview, ...record } = publicJob(job);
+  return { ...record, action, ruleCount: safetyReview?.totalFindings || 0 };
 }
 
 export class XshellBridgeCore {

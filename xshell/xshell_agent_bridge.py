@@ -1000,6 +1000,12 @@ def _hard_findings(original, blanked):
             word = _unquote_word(raw)
             if word and "\x01" not in word:
                 arg_tokens.append(word)
+        if base == "git":
+            words = original[segment_start:cursor].split()
+            if (words[:2] == ["git", "clean"]
+                    and all(re.fullmatch(r"-[dfnxX]+", word) or word == "--dry-run" for word in words[2:])
+                    and any("n" in word for word in words[2:])):
+                continue
         category = _classify_hard(base, arg_tokens)
         if not category:
             continue
@@ -1181,7 +1187,11 @@ def _interpreter_findings(original, masked, depth):
             script = _extract_dash_c(raw_args, arg_offsets, segment_start)
             if script:
                 inner = analyze_command(script["content"], depth + 1)
-                if not inner["findings"]:
+                plain_script = (resolved["commandIndex"] == 0 and len(raw_args) == 2 and raw_args[0] == "-c" and raw_args[1].startswith("'")
+                                and not re.search(r"[\r\n]", script["content"])
+                                and all(re.fullmatch(r"(?:pgrep|head|tail|wc|pwd|id|whoami|uname|hostname|ss)(?: +[A-Za-z0-9_./:-]+)*", part.strip())
+                                        for part in script["content"].split("|")))
+                if not inner["findings"] and plain_script and _evaluate_pipeline(script["content"])["ok"]:
                     continue
                 hoisted = []
                 if script["literal"]:
@@ -1721,6 +1731,10 @@ def _curl_readonly(tokens):
 
 
 def _args_are_readonly(name, arg_tokens):
+    if name == "hostname":
+        return not arg_tokens or (len(arg_tokens) == 1 and arg_tokens[0] in ("-I", "-i", "-f", "-s"))
+    if name == "ss":
+        return all(re.fullmatch(r"-[alntup46]+", token) for token in arg_tokens)
     if name == "sed":
         return not _sed_writes(arg_tokens)
     if name == "sort":
@@ -1772,42 +1786,13 @@ def _evaluate_pipeline(inner):
     return {"ok": True, "reason": "内部仅调用只读命令"}
 
 
-def _object_in(source):
-    source = str(source or "")
-    found = re.search(r"\bof\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|(\S+))", source, re.I)
-    if found:
-        value = (found.group(1) or found.group(2) or found.group(3) or "").rstrip(");")
-        if value and value != "/dev/null":
-            return value
-    redir = re.search(r"(?:&>>|&>|>>|(?<!&)>)\s*(?:\"([^\"]+)\"|'([^']+)'|(/[^\s;&|]+))", source)
-    if redir:
-        target = redir.group(1) or redir.group(2) or redir.group(3)
-        if target and target != "/dev/null":
-            return target
-    paths = [
-        item.group(1)
-        for item in re.finditer(r"(?:^|[\s=])(/(?:[\w.+@=-]+/)*[\w.+@=-]+)", source)
-        if item.group(1) != "/dev/null"
-    ]
-    return paths[-1] if paths else None
-
-
-def _extract_target(text, finding):
-    match = str(finding.get("match") or "")
-    found = _object_in(match)
-    if found:
-        return found
-    start = max(0, finding.get("index") or 0)
-    line_end = text.find("\n", start)
-    if line_end < 0:
-        line = text[start:min(len(text), start + len(match) + 160)]
-    else:
-        line = text[start:line_end]
-    return _object_in(line)
-
-
 def _annotate_finding(text, finding):
-    finding["target"] = _extract_target(text, finding)
+    nested = re.fullmatch(r"\$\((rm [^()]+)\)", finding["match"])
+    words = _shell_words(nested.group(1) if nested else finding["match"])
+    simple_delete = (finding["category"].startswith("文件删除或内容清空") and words[:1] == ["rm"]
+                     and len(finding["match"]) < 200 and all(
+                         re.fullmatch(r"-[rRfidv]+|[./a-zA-Z0-9_][./a-zA-Z0-9_-]*", word) for word in words[1:]))
+    finding["target"] = ("、".join(word for word in words[1:] if not word.startswith("-")) or None) if simple_delete else None
     finding["impact"] = _impact_for(finding.get("category"))
     return finding
 
@@ -1964,6 +1949,8 @@ def _highlight_spans(text, findings):
 
 def _excerpt(marked):
     lines = marked.split("\n")
+    if len(lines) <= 8 and all(len(line) <= 180 for line in lines):
+        return marked
     hot = set()
     for index, line in enumerate(lines):
         if "【" in line or "】" in line:
@@ -2024,7 +2011,26 @@ def _fit_message(text):
     return fitted
 
 
-def approval_message(job, analysis=None):
+def confirmation_reason(job, analysis):
+    if job["action"].get("type") == "interrupt":
+        return "interrupt"
+    if (analysis or {}).get("findings") or (job.get("safetyReview") or {}).get("findings"):
+        return "rule"
+    if job["action"].get("riskLevel") in ("high", "critical"):
+        return "agent_risk"
+    return "safe_mode" if job.get("safetyMode", "safe") == "safe" else "gateway"
+
+
+CONFIRMATION_REASONS = {
+    "interrupt": "中断当前前台任务",
+    "rule": "命中终端安全规则",
+    "agent_risk": "Agent 将操作评为高风险",
+    "safe_mode": "safe 模式逐项确认",
+    "gateway": "网关要求确认或任务缺少免确认标记",
+}
+
+
+def approval_message(job, analysis=None, include_state=False):
     action = job.get("action", {})
     findings, auto, total = _collect_review(job, analysis)
     meta = metadata()
@@ -2043,7 +2049,7 @@ def approval_message(job, analysis=None):
         operation = "发送 Ctrl+C 中断当前命令"
         shown_input = "Ctrl+C"
         shown_findings = []
-    header = ["AI Agent 请求执行一个终端操作。", ""]
+    header = [host_line, "确认原因：" + CONFIRMATION_REASONS[confirmation_reason(job, analysis)], ""]
     if findings:
         header.append("⚠ 需要你重点确认：" + str(total) + " 处")
         header.append("────────────────────────────")
@@ -2051,8 +2057,7 @@ def approval_message(job, analysis=None):
             header.append("%d) 规则：%s" % (order, finding.get("category")))
             header.append("   片段：" + _snippet(finding))
             target = finding.get("target")
-            if target:
-                header.append("   对象：" + str(target))
+            header.append("   对象：" + str(target or "未确定，请核对命令"))
             impact = finding.get("impact") or _impact_for(finding.get("category"))
             header.append("   后果：" + str(impact))
         if total > len(shown_findings):
@@ -2066,7 +2071,6 @@ def approval_message(job, analysis=None):
         header.append("")
     command_label = "命令（【】内为需要确认的片段；长命令只展示命中行及其相邻一行）：" if action.get("type") == "send" else "输入："
     message = "\n".join(header) + "\n" + "\n".join([
-        host_line,
         "Agent：" + str(job.get("agentId", "unknown-agent")),
         "操作：" + operation,
         "风险等级：" + RISK_LABELS.get(str(action.get("riskLevel", "")), "未说明"),
@@ -2084,13 +2088,32 @@ def approval_message(job, analysis=None):
         "",
         "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。",
     ])
-    return _fit_message(message)
+    message = _escape_controls(_fit_message(message))
+    excerpted = action.get("type") == "send" and (_excerpt(marked) != marked or message.find("\n---\n" + shown_input + "\n---\n") < 0)
+    return (message, excerpted) if include_state else message
 
 
 def request_user_approval(job, analysis=None):
     try:
-        # Xshell MessageBox nType=4 displays Yes/No; return value 6 means Yes.
-        return int(xsh.Dialog.MessageBox(approval_message(job, analysis), "Xshell Agent Bridge 安全确认", 4)) == 6
+        message, excerpted = approval_message(job, analysis, include_state=True)
+        title = "Xshell Agent Bridge 安全确认"
+        if not excerpted:
+            return int(xsh.Dialog.MessageBox(message, title, 4)) == 6
+        # Yes opens the full input, No rejects, Cancel rejects. Approval is
+        # requested only on the final page to keep every dismissal fail-closed.
+        message = message.rsplit("\n", 1)[0] + "\n是：查看完整输入后确认。否：拒绝。"
+        if int(xsh.Dialog.MessageBox(message, title, 4)) != 6:
+            return False
+        remaining = _escape_controls(job["action"]["text"])
+        while remaining:
+            size = min(len(remaining), 1000)
+            lines = remaining[:size].splitlines(True)
+            size = sum(len(line) for line in lines[:24])
+            page, remaining = remaining[:size], remaining[size:]
+            prompt = "是：查看下一页。否：拒绝。" if remaining else "是：同意发送以上各页完整输入。否：拒绝。"
+            if int(xsh.Dialog.MessageBox(page + "\n\n" + prompt, title, 4)) != 6:
+                return False
+        return True
     except Exception as error:
         raise RuntimeError("无法显示 Xshell 安全确认框，已拒绝执行：" + str(error))
 
@@ -2133,6 +2156,7 @@ def execute_job(job):
             )
         )
         if confirmation_required:
+            result["confirmationReason"] = confirmation_reason(job, analysis)
             result["approvedByUser"] = request_user_approval(job, analysis)
             result["confirmationShown"] = True
             if not result["approvedByUser"]:

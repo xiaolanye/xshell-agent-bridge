@@ -660,6 +660,12 @@ function hardFindings(original, blanked) {
     const base = normalizeCommandBase(token);
     if (!base) continue;
     const argTokens = tokens.slice(resolved.commandIndex + 1).map(unquoteWord).filter((word) => word && !word.includes('\u0001'));
+    if (base === 'git') {
+      const words = original.slice(segmentStart, cursor).trim().split(/\s+/);
+      if (words[0] === 'git' && words[1] === 'clean'
+          && words.slice(2).every((word) => /^-[dfnxX]+$/.test(word) || word === '--dry-run')
+          && words.slice(2).some((word) => word === '--dry-run' || word.includes('n'))) continue;
+    }
     const category = classifyHard(base, argTokens);
     if (!category) continue;
     const index = segmentStart + offsets[resolved.commandIndex];
@@ -823,7 +829,11 @@ function interpreterFindings(original, masked, depth) {
       const script = extractDashC(rawArgs, argOffsets, segmentStart);
       if (script) {
         const inner = analyzeCommand(script.content, depth + 1);
-        if (!inner.findings.length) continue;
+        const plainScript = resolved.commandIndex === 0 && rawArgs.length === 2 && rawArgs[0] === '-c' && rawArgs[1].startsWith("'")
+          && script.content.split('|').every((part) =>
+            /^(?:pgrep|head|tail|wc|pwd|id|whoami|uname|hostname|ss)(?: +[A-Za-z0-9_./:-]+)*$/.test(part.trim()))
+          && !/[\r\n]/.test(script.content);
+        if (!inner.findings.length && plainScript && evaluatePipeline(script.content).ok) continue;
         const hoisted = [];
         if (script.literal) {
           for (const finding of inner.findings) {
@@ -1323,6 +1333,8 @@ function curlReadonly(tokens) {
 }
 
 function argsAreReadonly(name, argTokens) {
+  if (name === 'hostname') return argTokens.length === 0 || (argTokens.length === 1 && ['-I', '-i', '-f', '-s'].includes(argTokens[0]));
+  if (name === 'ss') return argTokens.every((token) => /^-[alntup46]+$/.test(token));
   if (name === 'sed') return !sedWrites(argTokens);
   if (name === 'sort') return !sortWrites(argTokens);
   if (name === 'date') return !dateWrites(argTokens);
@@ -1363,36 +1375,12 @@ function evaluatePipeline(inner) {
   return { ok: true, reason: '内部仅调用只读命令' };
 }
 
-function objectIn(source) {
-  const text = String(source || '');
-  const of = text.match(/\bof\s*=\s*(?:"([^"]+)"|'([^']+)'|(\S+))/i);
-  if (of) {
-    const value = (of[1] || of[2] || of[3] || '').replace(/[);]+$/g, '');
-    if (value && value !== '/dev/null') return value;
-  }
-  const redir = text.match(/(?:&>>|&>|>>|(?<!&)>)\s*(?:"([^"]+)"|'([^']+)'|(\/[^\s;&|]+))/);
-  if (redir) {
-    const target = redir[1] || redir[2] || redir[3];
-    if (target && target !== '/dev/null') return target;
-  }
-  const paths = [...text.matchAll(/(?:^|[\s=])(\/(?:[\w.+@=-]+\/)*[\w.+@=-]+)/g)]
-    .map((item) => item[1])
-    .filter((item) => item !== '/dev/null');
-  return paths.length ? paths[paths.length - 1] : null;
-}
-
-function extractTarget(text, finding) {
-  const match = String(finding.match || '');
-  const fromMatch = objectIn(match);
-  if (fromMatch) return fromMatch;
-  const start = Math.max(0, finding.index || 0);
-  const lineEnd = text.indexOf('\n', start);
-  const line = text.slice(start, lineEnd === -1 ? Math.min(text.length, start + match.length + 160) : lineEnd);
-  return objectIn(line);
-}
-
 function annotateFinding(text, finding) {
-  finding.target = extractTarget(text, finding);
+  const nested = /^\$\((rm [^()]+)\)$/.exec(finding.match);
+  const words = shellWords(nested ? nested[1] : finding.match);
+  const simpleDelete = finding.category.startsWith('文件删除或内容清空') && words[0] === 'rm'
+    && finding.match.length < 200 && words.slice(1).every((word) => /^-[rRfidv]+$|^[./a-zA-Z0-9_][./a-zA-Z0-9_-]*$/.test(word));
+  finding.target = simpleDelete ? words.slice(1).filter((word) => !word.startsWith('-')).join('、') || null : null;
   finding.impact = impactFor(finding.category);
   return finding;
 }

@@ -220,9 +220,11 @@ npm run demo:bridge
 - `xshell_send` 和 `xshell_interrupt` 强制要求 Agent 提供解释、预期结果及 `low` / `medium` / `high` / `critical` 风险等级。
 - 同一目标的低风险连续命令可以合并确认；确认说明必须披露全部动作和中间状态。破坏性或高风险动作必须单独说明。
 - 文件删除或清空、`find -delete/-exec`、容器与编排资源删除、数据库删除或清空、磁盘格式化或擦除、软件包卸载、Git 强制清理、关机重启和防火墙规则清空会被守护核心硬性拒绝，不进入 Xshell 队列。Xshell 脚本还会对任务文件做第二次检查。
-- 编码或下载内容直接交给 `sh` / `bash` 仍会被拒绝。解释器不再见名字就拦截：没有代码参数的 `--version` / `-V` / `-v` 可以放行；`sh -c` / `bash -c` 的引号字面量会再跑一遍同一套检查，内部没有命中才放行。`eval`、`source` 和点号执行保持拦截。
+- 编码或下载内容直接交给 `sh` / `bash` 仍会被拒绝。解释器不再见名字就拦截：没有代码参数的 `--version` / `-V` / `-v` 可以放行；`sh -c` / `bash -c` 仅对单引号内的简单查询管道免除解释器确认，例如用 pgrep 和 head 查询进程。各段必须通过只读参数校验。`eval`、`source` 和点号执行保持拦截。
 - 命令替换（`$(...)` 与反引号）和纯算术 `$((...))` 会逐层解析。只有命令名是裸名字或 `/bin/`、`/usr/bin/` 下的只读命令，且没有前导 `NAME=` 赋值、写参数或指向普通文件的重定向时，才自动放行。`/tmp/cat`、`./cat`、`sed -ri`、`sort -oFILE`、`awk -f`、`&> /tmp/x` 都不算只读；`>/dev/null`、`2>/dev/null`、`&>/dev/null` 和 `2>&1` 可以放行。`sudo`、`env`、`xargs` 等包装命令后面的替换或 `$var` / `${!var}` 仍要确认。
 - 只读诊断补充了 `hostname`、`ss`、`jq`、`vmstat`、`iostat`，以及受子命令限制的 `ip`、`journalctl`、`systemctl status/show/...`、`docker`/`podman` 查询、`kubectl get/describe/logs/...` 和纯 GET 的 `curl`。`wget` 默认落盘，不放进只读白名单。破坏性规则会跳过引号和注释，因此 `grep rm`、`echo 'delete from ...'` 不再误伤；`mysql -e "DELETE FROM ..."`、`psql -c "DROP TABLE ..."` 和 `git clean -fd` 仍然命中。静态文本策略不能替代服务器最小权限账号、受限 `sudoers`、文件权限、备份或经审核的命令白名单；企业服务器应继续使用这些系统级保护。
+- `normal` 下，`git clean -fdn` 这类只带预览选项组合的请求可以免除规则确认。Agent 标记为 high 或 critical 时仍需确认。命令替换内的 `hostname` 和 `ss` 按查询参数校验。
+- Xshell 确认框在顶部显示主机和确认原因。短命令直接确认，出现摘录时选择“是”查看完整输入，最后一页才确认发送。终端任务结果的 `confirmationReason` 记录触发类别，可按已完成或失败任务统计实际弹窗。
 - 每次命令或文件传输完成后，Agent 必须核验实际输出，并用中文解释成功或失败、关键输出、实际变化及遗留状态；“已批准”或“已发送”不能作为执行成功的依据。
 - 密码提示和常见命令行凭据模式会在桥接核心中被拒绝，敏感内容必须由用户直接在 Xshell 输入。
 - 最终批准发生在 Xshell 本地“是/否”窗口中，不依赖不同 Agent 客户端各自的审批设置。

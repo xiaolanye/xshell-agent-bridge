@@ -1,3 +1,4 @@
+import json
 import os
 from pathlib import Path
 import runpy
@@ -264,6 +265,33 @@ class CommandAnalysisTests(unittest.TestCase):
                 self.assertIsNotNone(self.analyze(text)["category"])
         self.assertIn("数据库", self.analyze('mysql -e "DELETE FROM sessions"')["category"])
         self.assertIn("数据库", self.analyze('psql -c "DROP TABLE users"')["category"])
+
+    def test_shared_normal_cases(self):
+        cases = json.loads(Path(__file__).with_name("normal-confirmation.json").read_text())
+        for text in cases["allow"]:
+            self.assertIsNone(self.analyze(text)["category"], text)
+        for text in cases["review"]:
+            self.assertTrue(self.analyze(text)["category"], text)
+
+    def test_full_input_review_and_rejection(self):
+        approve = self.module["request_user_approval"]
+        text = "x" * 2001 + " END"
+        job = {"action": {"type": "send", "riskLevel": "high", "text": text}}
+        pages = []
+
+        def show(message, title, buttons):
+            pages.append(message)
+            return 6
+
+        dialog = SimpleNamespace(MessageBox=show)
+        with patch.dict(approve.__globals__, {"xsh": SimpleNamespace(Dialog=dialog)}):
+            self.assertTrue(approve(job))
+            self.assertTrue(pages[0].startswith("目标主机：10.0.0.1"))
+            self.assertIn("确认原因：Agent", pages[0])
+            self.assertEqual("".join(page.rsplit("\n\n", 1)[0] for page in pages[1:]), text)
+            answers = iter([6, 7])
+            dialog.MessageBox = lambda *args: next(answers)
+            self.assertFalse(approve(job))
 
     def test_p2_dialog_keeps_newlines_context_and_real_indexes(self):
         text = "echo start\npython3 script.py\necho end\nrm /tmp/a; rm /tmp/b; rm /tmp/c; rm /tmp/d"

@@ -1,0 +1,19 @@
+{
+  "allow": [
+    "sh -c 'pgrep -f app | head -1'",
+    "X=$(hostname -I)",
+    "X=$(ss -lntp)",
+    "git clean -fdn",
+    "git clean --dry-run -fd"
+  ],
+  "review": [
+    "sh -c 'team_status_probe'",
+    "sh -c 'pwd' extra",
+    "X=$(hostname test-name)",
+    "X=$(ss -K)",
+    "git clean -fd",
+    "git clean -fd -- -n",
+    "git clean -fd -e -n",
+    "git clean -fdn; git clean -fd"
+  ]
+}
