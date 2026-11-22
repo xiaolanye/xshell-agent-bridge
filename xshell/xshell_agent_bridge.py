@@ -61,115 +61,6 @@ LAST_SCREEN = None
 LAST_META = None
 CACHED_SCREEN = None
 CACHED_AT = 0.0
-HARD_BLOCKED_INPUT_PATTERNS = (
-    (
-        "文件删除或内容清空",
-        re.compile(
-            r"(?:^|[\s;&|()'\"`])(?:/(?:usr/)?bin/)?"
-            r"(?:rm|rmdir|unlink|shred|remove-item|clear-content|erase|del|rd)"
-            r"(?=[\s;&|()'\"`]|$)",
-            re.I,
-        ),
-    ),
-    (
-        "脚本删除文件",
-        re.compile(
-            r"\b(?:os\.(?:remove|unlink)|shutil\.rmtree|fileutils\.rm_rf|"
-            r"fs\.(?:rm|unlink)(?:sync)?|[a-z_$][\w$]*\.unlink)\s*\(",
-            re.I,
-        ),
-    ),
-    (
-        "find 批量删除",
-        re.compile(r"\bfind\b[^\r\n]{0,2000}(?:-delete|-exec(?:dir)?\s+)", re.I),
-    ),
-    (
-        "容器或编排资源删除",
-        re.compile(
-            r"\b(?:(?:docker|podman)\s+"
-            r"(?:(?:container|image|volume|network|system|builder)\s+)?(?:rm|rmi|prune)|"
-            r"(?:docker|podman)\s+compose\b[^\r\n;&|]{0,240}\bdown\b|"
-            r"kubectl\s+delete|helm\s+uninstall|crictl\s+(?:rm|rmi))\b",
-            re.I,
-        ),
-    ),
-    (
-        "数据库删除或清空",
-        re.compile(
-            r"(?:^|[\s;\"'`])(?:drop\s+(?:database|schema|table|view|index|user)|"
-            r"truncate\s+(?:table\s+)?|delete\s+from)\b",
-            re.I,
-        ),
-    ),
-    (
-        "磁盘格式化或擦除",
-        re.compile(
-            r"(?:^|[\s;&|()'\"`])"
-            r"(?:mkfs(?:\.[\w-]+)?|wipefs|blkdiscard|fdisk|cfdisk|sfdisk|format-volume)"
-            r"(?=[\s;&|()'\"`]|$)|\bdd\b[^\r\n]{0,500}\bof\s*=\s*/dev/",
-            re.I,
-        ),
-    ),
-    (
-        "软件包卸载",
-        re.compile(
-            r"\b(?:(?:apt|apt-get)\b[^\r\n;&|]{0,240}\b(?:remove|purge|autoremove)|"
-            r"(?:yum|dnf)\b[^\r\n;&|]{0,240}\b(?:remove|erase|autoremove)|"
-            r"rpm\b[^\r\n;&|]{0,240}\s-e(?:\s|$)|apk\s+del|pacman\s+-R)\b",
-            re.I,
-        ),
-    ),
-    (
-        "版本库强制清理",
-        re.compile(
-            r"\bgit\s+(?:reset\b[^\r\n;&|]{0,240}--hard|"
-            r"clean\b[^\r\n;&|]{0,240}(?:-[^\s]*f|--force))\b",
-            re.I,
-        ),
-    ),
-    (
-        "关机或重启",
-        re.compile(
-            r"(?:^|[\s;&|()'\"`])(?:shutdown|reboot|poweroff|halt)"
-            r"(?=[\s;&|()'\"`]|$)|\bsystemctl\s+(?:poweroff|reboot|halt)\b|"
-            r"(?:^|[\s;&|])init\s+[06](?=\s|$)",
-            re.I,
-        ),
-    ),
-    (
-        "防火墙规则清空",
-        re.compile(
-            r"\biptables\b[^\r\n;&|]{0,240}(?:\s-F|\s-X|--flush)|"
-            r"\bnft\s+flush\s+ruleset\b",
-            re.I,
-        ),
-    ),
-)
-DYNAMIC_EXECUTION_PATTERNS = (
-    (
-        "将编码或下载内容交给命令解释器执行",
-        re.compile(
-            r"\b(?:base64|openssl\s+enc|xxd\s+-r|curl|wget)\b[^\r\n]{0,1000}"
-            r"\|\s*(?:(?:sudo|env|command|nohup)\s+)*(?:/?(?:usr/)?bin/)?(?:ba)?sh\b",
-            re.I,
-        ),
-    ),
-    (
-        "命令解释器或脚本解释器执行",
-        re.compile(
-            r"(?:^|[\r\n;&|]\s*)(?:(?:sudo|env|command|nohup|time|nice)\s+)*"
-            r"(?:/?(?:usr/)?bin/)?(?:ba)?sh\b|"
-            r"(?:^|[\r\n;&|]\s*)(?:(?:sudo|env|command|nohup|time|nice)\s+)*"
-            r"(?:/?(?:usr/)?bin/)?(?:python(?:3)?|node|perl|ruby|php|lua|pwsh|powershell|cmd(?:\.exe)?)\b",
-            re.I,
-        ),
-    ),
-    (
-        "动态变量或命令替换执行",
-        re.compile(r"\$\(|`|(?:^|[\r\n;&|]\s*)(?:eval|source)\b|(?:^|[\r\n;&|]\s*)\.\s+", re.I),
-    ),
-)
-
 
 def atomic_write_json(path, value):
     temporary = path + "." + os.urandom(4).hex() + ".tmp"
@@ -402,107 +293,1798 @@ def write_state():
     FORCE_STATE["flag"] = False
 
 
+
+# 命令体检与确认框文案。判定必须与 src/command-analysis.mjs 一致。
+
+_FLAGS = re.ASCII | re.IGNORECASE
+DELETE_COMMANDS = set([
+    "rm", "rmdir", "unlink", "shred", "remove-item", "clear-content", "erase", "del", "rd",
+])
+SHUTDOWN_COMMANDS = set(["shutdown", "reboot", "poweroff", "halt"])
+DISK_COMMANDS = set(["wipefs", "blkdiscard", "fdisk", "cfdisk", "sfdisk", "format-volume"])
+WRAPPERS = set(["sudo", "command", "env", "xargs", "nohup", "time", "nice", "exec", "builtin"])
+WRAPPER_ARG_OPTIONS = {
+    "sudo": set(["-u", "-g", "-p", "-h", "-C", "-D", "-T", "-R", "-U", "--user", "--group", "--prompt", "--host", "--chdir", "--role", "--other-user", "--close-from", "--command-timeout"]),
+    "command": set(),
+    "env": set(["-u", "-C", "-S", "--unset", "--chdir", "--split-string", "--default-signal", "--ignore-signal", "--block-signal", "--argv0"]),
+    "xargs": set(["-a", "-d", "-E", "-I", "-J", "-L", "-l", "-n", "-P", "-s", "--arg-file", "--delimiter", "--eof", "--replace", "--max-lines", "--max-args", "--max-procs", "--max-chars"]),
+    "nohup": set(),
+    "time": set(["-f", "-o", "--format", "--output"]),
+    "nice": set(["-n", "--adjustment"]),
+    "exec": set(["-a"]),
+    "builtin": set(),
+}
+BARE_READONLY = set([
+    "cat", "head", "tail", "grep", "egrep", "fgrep", "awk", "gawk", "sed", "cut", "tr",
+    "sort", "uniq", "wc", "ls", "df", "du", "free", "ps", "pgrep", "pidof",
+    "pwd", "whoami", "id", "uname", "date", "stat", "readlink", "realpath",
+    "basename", "dirname", "echo", "printf", "test", "expr", "true", "false", "seq",
+    "column", "lsblk", "lscpu", "nproc", "uptime", "which", "type", "printenv", "find",
+    "hostname", "ss", "jq", "vmstat", "iostat",
+])
+RESTRICTED_READONLY = set(["ip", "journalctl", "systemctl", "docker", "podman", "kubectl", "curl"])
+INTERPRETERS = set([
+    "sh", "bash", "python", "python3", "node", "perl", "ruby", "php", "lua", "pwsh", "powershell", "cmd", "cmd.exe",
+])
+VERSION_FLAGS = set(["--version", "-V", "-v"])
+IP_OBJECTS = set(["show", "list", "a", "r", "addr", "address", "route", "link"])
+IP_WRITE = set(["add", "del", "delete", "set", "change", "replace", "flush"])
+SYSTEMCTL_OK = set(["status", "show", "is-active", "is-enabled", "is-failed", "list-units", "list-unit-files", "cat"])
+SYSTEMCTL_ARG = set(["-t", "--type", "-p", "--property", "--state", "-o", "--output", "--root"])
+DOCKER_DIRECT = set(["ps", "images", "logs", "inspect", "stats", "top", "info", "version", "port", "diff"])
+KUBE_OK = set(["get", "describe", "logs", "top", "version", "cluster-info", "api-resources"])
+KUBE_ARG = set(["-n", "--namespace", "--context", "--kubeconfig", "-o", "--output", "-l", "--selector", "--field-selector", "--sort-by", "--cluster"])
+CURL_ARG = set(["-H", "--header", "-A", "--user-agent", "-e", "--referer", "-b", "--cookie", "--connect-timeout", "-m", "--max-time", "--retry", "--retry-delay", "-u", "--user", "--proxy"])
+PIPE_TO_SHELL = re.compile(
+    r"\b(?:base64|openssl\s+enc|xxd\s+-r|curl|wget)\b[^\r\n]{0,1000}"
+    r"\|\s*(?:(?:sudo|env|command|nohup)\s+)*(?:/(?:usr/)?bin/)?(?:ba)?sh\b",
+    _FLAGS,
+)
+SCRIPT_DELETE = re.compile(
+    r"\b(?:os\.(?:remove|unlink)|shutil\.rmtree|fileutils\.rm_rf|"
+    r"fs\.(?:rm|unlink)(?:sync)?|[a-z_$][\w$]*\.unlink)\s*\(",
+    _FLAGS,
+)
+SQL_PATTERN = re.compile(
+    r"(?:^|[\s;\"'`])(?:drop\s+(?:database|schema|table|view|index|user)|"
+    r"truncate\s+(?:table\s+)?|delete\s+from)\b",
+    _FLAGS,
+)
+DYNAMIC_ONLY = (
+    re.compile(r"(?:^|[\r\n;&|]\s*)(?:eval|source)\b", _FLAGS),
+    re.compile(r"(?:^|[\r\n;&|]\s*)\.\s+", _FLAGS),
+)
+_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+_VAR_RE = re.compile(r"^\$[A-Za-z_][A-Za-z0-9_]*$")
+_BRACE_VAR_RE = re.compile(r"^\$\{[^}]+\}$")
+_FIND_WRITE_RE = re.compile(r"(?:^|\s)(?:-delete|-exec|-execdir|-ok|-okdir|-fprint\w*|-fls)\b", re.ASCII)
+_DD_OF_RE = re.compile(r"\bof\s*=\s*/dev/", _FLAGS)
+_AWK_SYSTEM_RE = re.compile(r"system\s*\(")
+_AWK_GETLINE_RE = re.compile(r"\|\s*getline\b", re.ASCII)
+_AWK_PRINT_FILE_RE = re.compile(r"\bprintf?\b[^;\n]*>>?\s*[\"'/]", re.ASCII)
+_AWK_PRINT_PIPE_RE = re.compile(r"\bprintf?\b[^;\n]*\|\s*[\"']", re.ASCII)
+_VACUUM_RE = re.compile(r"^--vacuum-")
+_SED_FLAG_SPACE_RE = re.compile(r"^[ \t]+[wWe](?:\s|;|$)")
+IMPACTS = (
+    ("文件删除或内容清空", "会删除文件或清空文件内容"),
+    ("脚本删除文件", "会在脚本里删除文件"),
+    ("find 批量删除", "会按条件批量删除文件或执行命令"),
+    ("容器或编排资源删除", "会删除容器、镜像或编排资源"),
+    ("数据库删除或清空", "会删除或清空数据库里的对象"),
+    ("磁盘格式化或擦除", "会格式化或擦除磁盘上的数据"),
+    ("软件包卸载", "会卸载系统里的软件包"),
+    ("版本库强制清理", "会强制丢掉版本库里尚未提交的内容"),
+    ("关机或重启", "会关闭或重新启动这台机器"),
+    ("防火墙规则清空", "会清空防火墙规则"),
+    ("将编码或下载内容交给命令解释器执行", "会把下载或编码后的内容当作命令执行"),
+    ("命令解释器或脚本解释器执行", "会启动解释器执行一段代码"),
+    ("动态变量或命令替换执行", "实际要执行的命令在发送前无法确定"),
+)
+DIALOG_FINDING_LIMIT = 3
+DIALOG_FIELD_LIMIT = 120
+DIALOG_LINE_BUDGET = 48
+DIALOG_CHAR_BUDGET = 1600
+
+
+def _impact_for(category):
+    raw = str(category or "")
+    base = raw.replace("（命令替换内部）", "")
+    sentence = "需要你确认这段命令会做什么"
+    for name, text in IMPACTS:
+        if base.startswith(name):
+            sentence = text
+            break
+    if "（命令替换内部）" in raw:
+        return sentence + "（发生在命令替换内部）"
+    return sentence
+
+
+def _unquote_word(token):
+    out = []
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(token)
+    while i < length:
+        ch = token[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < length:
+                out.append(token[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            else:
+                out.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < length:
+            out.append(token[i + 1])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        out.append(ch)
+        i += 1
+    return "".join(out)
+
+
+def _is_assignment(word):
+    return _ASSIGN_RE.match(word) is not None
+
+
+def _is_variable_word(word):
+    return _VAR_RE.match(word) is not None or _BRACE_VAR_RE.match(word) is not None
+
+
+def _shell_words(segment):
+    words = []
+    buf = []
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(segment)
+    while i < length:
+        ch = segment[i]
+        if in_single:
+            buf.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            buf.append(segment[i:min(length, i + 2)])
+            i += 2
+            continue
+        if ch == '"':
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_double and ch.isspace():
+            if buf:
+                words.append("".join(buf))
+                buf = []
+            i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    if buf:
+        words.append("".join(buf))
+    return words
+
+
+def _token_offsets(segment, tokens):
+    offsets = []
+    cursor = 0
+    for token in tokens:
+        at = segment.find(token, cursor)
+        if at < 0:
+            at = cursor
+        offsets.append(at)
+        cursor = at + len(token)
+    return offsets
+
+
+def _split_shell_segments(text):
+    segments = []
+    buf = []
+    in_single = False
+    in_double = False
+    i = 0
+    length = len(text)
+    while i < length:
+        ch = text[i]
+        if in_single:
+            buf.append(ch)
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            buf.append(text[i:min(length, i + 2)])
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            buf.append(ch)
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            buf.append(ch)
+            i += 1
+            continue
+        if not in_double and ch in ";\n|&":
+            if ch == "&" and ((i + 1 < length and text[i + 1] == ">") or (buf and buf[-1] == ">")):
+                buf.append(ch)
+                i += 1
+                continue
+            segment = "".join(buf)
+            if segment.strip():
+                segments.append(segment)
+            buf = []
+            while i < length and text[i] in ";|&\n":
+                i += 1
+            continue
+        buf.append(ch)
+        i += 1
+    tail = "".join(buf)
+    if tail.strip():
+        segments.append(tail)
+    return segments
+
+
+def _match_heredoc(text, i):
+    if i + 2 >= len(text) or text[i] != "<" or text[i + 1] != "<" or text[i + 2] == "<":
+        return None
+    j = i + 2
+    strip_tabs = False
+    if j < len(text) and text[j] == "-":
+        strip_tabs = True
+        j += 1
+    while j < len(text) and text[j] in " \t":
+        j += 1
+    if j >= len(text) or text[j] in "\n;":
+        return None
+    delim = []
+    quoted = False
+    in_single = False
+    in_double = False
+    while j < len(text):
+        ch = text[j]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            else:
+                delim.append(ch)
+            j += 1
+            continue
+        if in_double:
+            if ch == "\\" and j + 1 < len(text):
+                delim.append(text[j + 1])
+                j += 2
+                continue
+            if ch == '"':
+                in_double = False
+            else:
+                delim.append(ch)
+            j += 1
+            continue
+        if ch == "\\" and j + 1 < len(text):
+            quoted = True
+            delim.append(text[j + 1])
+            j += 2
+            continue
+        if ch == "'":
+            quoted = True
+            in_single = True
+            j += 1
+            continue
+        if ch == '"':
+            quoted = True
+            in_double = True
+            j += 1
+            continue
+        if ch in " \t\n;&|<>":
+            break
+        delim.append(ch)
+        j += 1
+    word = "".join(delim)
+    if not word or in_single or in_double:
+        return None
+    return {"delim": word, "quoted": quoted, "stripTabs": strip_tabs, "end": j}
+
+
+def _line_is_delim(line, heredoc):
+    compare = line.lstrip("\t") if heredoc["stripTabs"] else line
+    return compare == heredoc["delim"]
+
+
+def _read_command_substitution(text, start):
+    depth = 1
+    j = start + 2
+    single = False
+    double = False
+    length = len(text)
+    while j < length and depth > 0:
+        ch = text[j]
+        if single:
+            if ch == "'":
+                single = False
+            j += 1
+            continue
+        if ch == "\\":
+            j += 2
+            continue
+        if ch == "'" and not double:
+            single = True
+            j += 1
+            continue
+        if ch == '"':
+            double = not double
+            j += 1
+            continue
+        if not double and ch == "(":
+            depth += 1
+        elif not double and ch == ")":
+            depth -= 1
+        j += 1
+    end = j if depth == 0 else length
+    inner_end = end - 1 if depth == 0 else end
+    return {
+        "kind": "command",
+        "raw": text[start:end],
+        "inner": text[start + 2:max(start + 2, inner_end)],
+        "index": start,
+        "end": end,
+    }
+
+
+def _read_backtick(text, start):
+    j = start + 1
+    length = len(text)
+    while j < length:
+        if text[j] == "\\":
+            j += 2
+            continue
+        if text[j] == "`":
+            j += 1
+            break
+        j += 1
+    closed = j > start + 1 and text[j - 1] == "`"
+    return {
+        "kind": "backtick",
+        "raw": text[start:j],
+        "inner": text[start + 1:j - 1 if closed else j],
+        "index": start,
+        "end": j,
+    }
+
+
+def _scan_shell(text):
+    substitutions = []
+    blanked = list(text)
+    pending = []
+    heredoc = None
+    in_single = False
+    in_double = False
+    in_comment = False
+    line_start = 0
+    i = 0
+    length = len(text)
+
+    def blank(frm, to):
+        end = min(to, len(blanked))
+        for k in range(max(0, frm), end):
+            if text[k] != "\n":
+                blanked[k] = " "
+
+    def start_pending():
+        nonlocal heredoc
+        if heredoc is None and pending:
+            heredoc = pending.pop(0)
+
+    while i < length:
+        if heredoc is not None and (heredoc["quoted"] or i == line_start):
+            nl = text.find("\n", i)
+            line_end = length if nl < 0 else nl
+            line = text[i:line_end]
+            if i == line_start and _line_is_delim(line, heredoc):
+                blank(i, line_end)
+                heredoc = None
+                i = length if nl < 0 else nl + 1
+                line_start = i
+                start_pending()
+                continue
+            if heredoc["quoted"]:
+                blank(i, line_end)
+                i = length if nl < 0 else nl + 1
+                line_start = i
+                continue
+        if i >= length:
+            break
+        ch = text[i]
+        if ch == "\n":
+            in_comment = False
+            i += 1
+            line_start = i
+            if not in_single and not in_double:
+                start_pending()
+            continue
+        if in_comment:
+            blanked[i] = " "
+            i += 1
+            continue
+        if in_single:
+            blanked[i] = " "
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            if not in_double and heredoc is None and i + 1 < length and text[i + 1] == "\n":
+                blanked[i] = " "
+                i += 1
+                continue
+            nxt = min(length, i + 2)
+            if in_double or heredoc is not None:
+                blank(i, nxt)
+            i = nxt
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            blanked[i] = " "
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            blanked[i] = " "
+            i += 1
+            continue
+        if in_double:
+            if ch == "$" and text[i + 1:i + 3] == "((":
+                blank(i, i + 3)
+                i += 3
+                continue
+            if ch == "$" and i + 1 < length and text[i + 1] == "(":
+                sub = _read_command_substitution(text, i)
+                substitutions.append(sub)
+                blank(sub["index"], sub["end"])
+                i = sub["end"]
+                continue
+            if ch == "`":
+                sub = _read_backtick(text, i)
+                substitutions.append(sub)
+                blank(sub["index"], sub["end"])
+                i = sub["end"]
+                continue
+            blanked[i] = " "
+            i += 1
+            continue
+        if ch == "#":
+            in_comment = True
+            blanked[i] = " "
+            i += 1
+            continue
+        if heredoc is None:
+            opener = _match_heredoc(text, i)
+            if opener:
+                pending.append(opener)
+                i = opener["end"]
+                continue
+        if ch == "$" and i + 1 < length and text[i + 1] == "(":
+            if i + 2 < length and text[i + 2] == "(":
+                i += 3
+                continue
+            sub = _read_command_substitution(text, i)
+            substitutions.append(sub)
+            blank(sub["index"], sub["end"])
+            i = sub["end"]
+            continue
+        if ch == "`":
+            sub = _read_backtick(text, i)
+            substitutions.append(sub)
+            blank(sub["index"], sub["end"])
+            i = sub["end"]
+            continue
+        if heredoc is not None and not heredoc["quoted"]:
+            blanked[i] = " "
+        i += 1
+    return {"substitutions": substitutions, "blanked": "".join(blanked)}
+
+def _mask_substitutions(text, substitutions):
+    masked = text
+    for entry in sorted(substitutions, key=lambda item: item["index"], reverse=True):
+        masked = masked[:entry["index"]] + ("\x01" * len(entry["raw"])) + masked[entry["index"] + len(entry["raw"]):]
+    return masked
+
+
+def _basename_of(word):
+    slash = max(word.rfind("/"), word.rfind("\\"))
+    return (word[slash + 1:] if slash >= 0 else word).lower()
+
+
+def _normalize_command_base(token):
+    word = _unquote_word(token)
+    while word.startswith("("):
+        word = word[1:]
+    while word.endswith(")"):
+        word = word[:-1]
+    if not word or "\x01" in word:
+        return ""
+    return _basename_of(word)
+
+
+def _is_trusted_command_token(token):
+    word = _unquote_word(token)
+    while word.startswith("("):
+        word = word[1:]
+    while word.endswith(")"):
+        word = word[:-1]
+    if not word or "\x01" in word:
+        return False
+    if "/" not in word and "\\" not in word:
+        return True
+    if word.startswith("/bin/") and "/" not in word[5:]:
+        return True
+    if word.startswith("/usr/bin/") and "/" not in word[9:]:
+        return True
+    return False
+
+
+def _trusted_readonly_name(token):
+    if not _is_trusted_command_token(token):
+        return None
+    base = _normalize_command_base(token)
+    if base in BARE_READONLY or base in RESTRICTED_READONLY:
+        return base
+    return None
+
+
+def _resolve_invocation(tokens):
+    i = 0
+    leading = False
+    while i < len(tokens) and _is_assignment(_unquote_word(tokens[i])):
+        leading = True
+        i += 1
+    env_assign = False
+    while i < len(tokens):
+        shown = _unquote_word(tokens[i])
+        if "\x01" in shown:
+            return {"commandIndex": i, "leadingAssign": leading, "envAssign": env_assign, "dynamic": True}
+        name = _basename_of(shown.lstrip("(").rstrip(")"))
+        if name not in WRAPPERS:
+            return {"commandIndex": i, "leadingAssign": leading, "envAssign": env_assign, "dynamic": False}
+        arg_opts = WRAPPER_ARG_OPTIONS.get(name, set())
+        i += 1
+        while i < len(tokens):
+            word = _unquote_word(tokens[i])
+            if "\x01" in word:
+                return {"commandIndex": i, "leadingAssign": leading, "envAssign": env_assign, "dynamic": True}
+            if word == "--":
+                i += 1
+                break
+            if name == "env" and _is_assignment(word):
+                env_assign = True
+                i += 1
+                continue
+            if word.startswith("-"):
+                opt = word.split("=", 1)[0]
+                if "=" not in word and opt in arg_opts:
+                    i += 2
+                    continue
+                i += 1
+                continue
+            break
+    return {"commandIndex": -1, "leadingAssign": leading, "envAssign": env_assign, "dynamic": False}
+
+
+def _operands(words):
+    out = []
+    for i, word in enumerate(words):
+        if word == "--":
+            for rest in words[i + 1:]:
+                if not rest.startswith("-"):
+                    out.append(rest)
+            break
+        if word.startswith("-"):
+            continue
+        out.append(word)
+    return out
+
+
+def _short_cluster_has(token, letter):
+    return token.startswith("-") and not token.startswith("--") and letter in token[1:]
+
+
+def _classify_hard(base, arg_tokens):
+    args = " ".join(arg_tokens)
+    ops = _operands(arg_tokens)
+    if base in DELETE_COMMANDS:
+        return "文件删除或内容清空"
+    if base in SHUTDOWN_COMMANDS:
+        return "关机或重启"
+    if base == "find" and _FIND_WRITE_RE.search(args):
+        return "find 批量删除"
+    if base in ("docker", "podman"):
+        if "rm" in ops or "rmi" in ops or "prune" in ops:
+            return "容器或编排资源删除"
+        if "compose" in ops and "down" in ops:
+            return "容器或编排资源删除"
+    if base == "kubectl" and "delete" in ops:
+        return "容器或编排资源删除"
+    if base == "helm" and "uninstall" in ops:
+        return "容器或编排资源删除"
+    if base == "crictl" and ("rm" in ops or "rmi" in ops):
+        return "容器或编排资源删除"
+    if base in ("apt", "apt-get") and any(word in ("remove", "purge", "autoremove") for word in ops):
+        return "软件包卸载"
+    if base in ("yum", "dnf") and any(word in ("remove", "erase", "autoremove") for word in ops):
+        return "软件包卸载"
+    if base == "rpm" and any(word == "-e" for word in arg_tokens):
+        return "软件包卸载"
+    if base == "apk" and "del" in ops:
+        return "软件包卸载"
+    if base == "pacman" and any(word.startswith("-R") for word in arg_tokens):
+        return "软件包卸载"
+    if base in DISK_COMMANDS or base == "mkfs" or base.startswith("mkfs."):
+        return "磁盘格式化或擦除"
+    if base == "dd" and _DD_OF_RE.search(args):
+        return "磁盘格式化或擦除"
+    if base == "git":
+        if ops and ops[0] == "reset" and any(word == "--hard" for word in arg_tokens):
+            return "版本库强制清理"
+        if ops and ops[0] == "clean" and any(word == "--force" or _short_cluster_has(word, "f") for word in arg_tokens):
+            return "版本库强制清理"
+    if base == "systemctl" and ops and ops[0] in ("poweroff", "reboot", "halt"):
+        return "关机或重启"
+    if base == "init" and arg_tokens and arg_tokens[0] in ("0", "6"):
+        return "关机或重启"
+    if base in ("iptables", "ip6tables") and any(word in ("-F", "-X", "--flush") for word in arg_tokens):
+        return "防火墙规则清空"
+    if base == "nft" and len(ops) > 1 and ops[0] == "flush" and ops[1] == "ruleset":
+        return "防火墙规则清空"
+    return None
+
+
+def _push_finding(findings, finding):
+    findings.append({
+        "tier": finding["tier"],
+        "category": finding["category"],
+        "match": str(finding.get("match") or "")[:240],
+        "index": finding["index"],
+        "reason": finding["reason"],
+    })
+
+
+def _hard_findings(original, blanked):
+    findings = []
+    cursor = 0
+    for segment in _split_shell_segments(blanked):
+        segment_start = blanked.find(segment, cursor)
+        if segment_start < 0:
+            continue
+        cursor = segment_start + len(segment)
+        tokens = _shell_words(segment)
+        if not tokens:
+            continue
+        offsets = _token_offsets(segment, tokens)
+        resolved = _resolve_invocation(tokens)
+        if resolved["commandIndex"] < 0 or resolved["dynamic"]:
+            continue
+        token = tokens[resolved["commandIndex"]]
+        base = _normalize_command_base(token)
+        if not base:
+            continue
+        arg_tokens = []
+        for raw in tokens[resolved["commandIndex"] + 1:]:
+            word = _unquote_word(raw)
+            if word and "\x01" not in word:
+                arg_tokens.append(word)
+        category = _classify_hard(base, arg_tokens)
+        if not category:
+            continue
+        index = segment_start + offsets[resolved["commandIndex"]]
+        end = segment_start + offsets[-1] + len(tokens[-1])
+        match = original[index:min(len(original), max(end, index + len(token)), index + 200)]
+        _push_finding(findings, {
+            "tier": "hard", "category": category, "match": match, "index": index, "reason": "命中高危命令特征",
+        })
+    script = SCRIPT_DELETE.search(blanked)
+    if script:
+        _push_finding(findings, {
+            "tier": "hard",
+            "category": "脚本删除文件",
+            "match": original[script.start():script.end()],
+            "index": script.start(),
+            "reason": "命中高危命令特征",
+        })
+    sql = SQL_PATTERN.search(blanked)
+    if sql:
+        _push_finding(findings, {
+            "tier": "hard",
+            "category": "数据库删除或清空",
+            "match": original[sql.start():sql.end()],
+            "index": sql.start(),
+            "reason": "命中高危命令特征",
+        })
+    return findings
+
+
+def _parse_quoted(raw):
+    if len(raw) >= 2 and raw[0] == "'" and raw[-1] == "'":
+        return {"quoted": True, "content": raw[1:-1], "contentOffset": 1, "literal": True}
+    if len(raw) >= 2 and raw[0] == '"' and raw[-1] == '"':
+        body = raw[1:-1]
+        out = []
+        i = 0
+        while i < len(body):
+            if body[i] == "\\" and i + 1 < len(body):
+                out.append(body[i + 1])
+                i += 2
+                continue
+            out.append(body[i])
+            i += 1
+        content = "".join(out)
+        return {"quoted": True, "content": content, "contentOffset": 1, "literal": content == body}
+    return {"quoted": False, "content": raw, "contentOffset": 0, "literal": False}
+
+
+def _db_client_findings(original):
+    findings = []
+    cursor = 0
+    for segment in _split_shell_segments(original):
+        segment_start = original.find(segment, cursor)
+        if segment_start < 0:
+            continue
+        cursor = segment_start + len(segment)
+        tokens = _shell_words(segment)
+        offsets = _token_offsets(segment, tokens)
+        resolved = _resolve_invocation(tokens)
+        if resolved["commandIndex"] < 0 or resolved["dynamic"]:
+            continue
+        base = _normalize_command_base(tokens[resolved["commandIndex"]])
+        if base in ("mysql", "mariadb"):
+            names = ["-e", "--execute"]
+        elif base == "psql":
+            names = ["-c", "--command"]
+        else:
+            continue
+        args = tokens[resolved["commandIndex"] + 1:]
+        arg_offsets = offsets[resolved["commandIndex"] + 1:]
+        i = 0
+        while i < len(args):
+            raw = args[i]
+            word = _unquote_word(raw)
+            sql = None
+            sql_offset = 0
+            if word in names:
+                if i + 1 >= len(args):
+                    i += 1
+                    continue
+                nxt = args[i + 1]
+                parsed = _parse_quoted(nxt)
+                sql = parsed["content"] if parsed["quoted"] else _unquote_word(nxt)
+                sql_offset = arg_offsets[i + 1] + (parsed["contentOffset"] if parsed["quoted"] else 0)
+                i += 1
+            else:
+                attached = None
+                for name in names:
+                    if word.startswith(name + "=") or (name.startswith("-") and len(name) == 2 and word.startswith(name) and len(word) > len(name)):
+                        attached = name
+                        break
+                if not attached:
+                    i += 1
+                    continue
+                if word.startswith(attached + "="):
+                    sql = word[len(attached) + 1:]
+                else:
+                    sql = word[len(attached):]
+                parsed = _parse_quoted(sql)
+                sql = parsed["content"] if parsed["quoted"] else sql
+                located = raw.find(sql)
+                sql_offset = arg_offsets[i] + (located if located >= 0 else 0)
+            if sql and SQL_PATTERN.search(sql):
+                index = segment_start + sql_offset
+                match = original[index:index + len(sql)] or sql
+                _push_finding(findings, {
+                    "tier": "hard",
+                    "category": "数据库删除或清空",
+                    "match": match,
+                    "index": index,
+                    "reason": "数据库客户端会执行引号里的删除语句",
+                })
+            i += 1
+    return findings
+
+
+def _extract_dash_c(raw_tokens, base_offsets, segment_start):
+    for i, raw in enumerate(raw_tokens):
+        if "\x01" in raw:
+            return None
+        word = _unquote_word(raw)
+        if word == "--":
+            return None
+        if not word.startswith("-") or word.startswith("--"):
+            if word.startswith("-"):
+                continue
+            return None
+        marker = word.find("c")
+        if marker < 0:
+            continue
+        c_at = raw.find("c")
+        after = raw[c_at + 1:]
+        if after:
+            parsed = _parse_quoted(after)
+            if not parsed["quoted"]:
+                return None
+            return dict(parsed, contentAbs=segment_start + base_offsets[i] + c_at + 1 + parsed["contentOffset"])
+        if i + 1 >= len(raw_tokens):
+            return None
+        parsed = _parse_quoted(raw_tokens[i + 1])
+        if not parsed["quoted"]:
+            return None
+        return dict(parsed, contentAbs=segment_start + base_offsets[i + 1] + parsed["contentOffset"])
+    return None
+
+
+def _interpreter_findings(original, masked, depth):
+    findings = []
+    cursor = 0
+    for segment in _split_shell_segments(masked):
+        segment_start = masked.find(segment, cursor)
+        if segment_start < 0:
+            continue
+        cursor = segment_start + len(segment)
+        original_segment = original[segment_start:segment_start + len(segment)]
+        tokens = _shell_words(segment)
+        if not tokens:
+            continue
+        offsets = _token_offsets(segment, tokens)
+        resolved = _resolve_invocation(tokens)
+        if resolved["commandIndex"] < 0:
+            continue
+        cmd_token = tokens[resolved["commandIndex"]]
+        cmd_word = _unquote_word(cmd_token)
+        if "\x01" in cmd_word or resolved["dynamic"]:
+            continue
+        base = _normalize_command_base(cmd_token)
+        if base not in INTERPRETERS:
+            continue
+        arg_tokens = tokens[resolved["commandIndex"] + 1:]
+        arg_offsets = offsets[resolved["commandIndex"] + 1:]
+        raw_args = [original_segment[arg_offsets[n]:arg_offsets[n] + len(token)] for n, token in enumerate(arg_tokens)]
+        trusted = _is_trusted_command_token(cmd_token) and not resolved["leadingAssign"] and not resolved["envAssign"]
+        version_only = trusted and raw_args and all(_unquote_word(token) in VERSION_FLAGS for token in raw_args)
+        if version_only:
+            continue
+        if trusted and base in ("sh", "bash"):
+            script = _extract_dash_c(raw_args, arg_offsets, segment_start)
+            if script:
+                inner = analyze_command(script["content"], depth + 1)
+                if not inner["findings"]:
+                    continue
+                hoisted = []
+                if script["literal"]:
+                    for finding in inner["findings"]:
+                        index = script["contentAbs"] + finding["index"]
+                        match = str(finding.get("match") or "")
+                        if match and original[index:index + len(match)] == match:
+                            copied = dict(finding)
+                            copied["index"] = index
+                            hoisted.append(copied)
+                if hoisted:
+                    findings.extend(hoisted)
+                    continue
+        index = segment_start + offsets[resolved["commandIndex"]]
+        _push_finding(findings, {
+            "tier": "dynamic",
+            "category": "命令解释器或脚本解释器执行",
+            "match": original[index:index + len(cmd_token)][:200],
+            "index": index,
+            "reason": "命中把内容交给解释器执行的写法",
+        })
+    return findings
+
+
+def _command_position_findings(original, masked, substitutions):
+    findings = []
+    cursor = 0
+    for segment in _split_shell_segments(masked):
+        segment_start = masked.find(segment, cursor)
+        if segment_start < 0:
+            continue
+        cursor = segment_start + len(segment)
+        tokens = _shell_words(segment)
+        if not tokens:
+            continue
+        offsets = _token_offsets(segment, tokens)
+        resolved = _resolve_invocation(tokens)
+        if resolved["commandIndex"] < 0:
+            continue
+        pos = resolved["commandIndex"]
+        token = tokens[pos]
+        index = segment_start + offsets[pos]
+        match = original[index:index + len(token)]
+        covered = any(entry["verdict"] == "blocked" and entry["index"] == index for entry in substitutions)
+        if covered:
+            continue
+        word = _unquote_word(token)
+        if "\x01" in word or "$(" in match or "`" in match:
+            _push_finding(findings, {
+                "tier": "dynamic",
+                "category": "动态变量或命令替换执行",
+                "match": match[:240],
+                "index": index,
+                "reason": "命令替换的结果被直接当作命令执行",
+            })
+        elif _is_variable_word(word):
+            _push_finding(findings, {
+                "tier": "dynamic",
+                "category": "动态变量或命令替换执行",
+                "match": word[:120],
+                "index": index,
+                "reason": "变量被当作命令执行，真正执行的命令静态不可知",
+            })
+    return findings
+
+
+def _read_redirect_target(text, i):
+    while i < len(text) and text[i] in " \t":
+        i += 1
+    target = []
+    in_single = False
+    in_double = False
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            else:
+                target.append(ch)
+            i += 1
+            continue
+        if in_double:
+            if ch == "\\" and i + 1 < len(text):
+                target.append(text[i + 1])
+                i += 2
+                continue
+            if ch == '"':
+                in_double = False
+            else:
+                target.append(ch)
+            i += 1
+            continue
+        if ch == "\\" and i + 1 < len(text):
+            target.append(text[i + 1])
+            i += 2
+            continue
+        if ch == "'":
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = True
+            i += 1
+            continue
+        if ch in " \t\n;&|<>":
+            break
+        target.append(ch)
+        i += 1
+    return {"target": "".join(target), "end": i}
+
+
+def _redirect_at(text, i):
+    if text.startswith("&>>", i):
+        target = _read_redirect_target(text, i + 3)
+        return {"safe": target["target"] == "/dev/null", "next": target["end"]}
+    if text.startswith("&>", i):
+        target = _read_redirect_target(text, i + 2)
+        return {"safe": target["target"] == "/dev/null", "next": target["end"]}
+    j = i
+    while j < len(text) and text[j].isdigit():
+        j += 1
+    at = j
+    if text.startswith(">&", at):
+        target = _read_redirect_target(text, at + 2)
+        if target["target"].isdigit():
+            return {"safe": True, "next": target["end"]}
+        return {"safe": target["target"] == "/dev/null", "next": target["end"]}
+    if text.startswith(">>", at):
+        target = _read_redirect_target(text, at + 2)
+        return {"safe": target["target"] == "/dev/null", "next": target["end"]}
+    if at < len(text) and text[at] == ">":
+        target = _read_redirect_target(text, at + 1)
+        return {"safe": target["target"] == "/dev/null", "next": target["end"]}
+    return None
+
+
+def _skip_arithmetic(text, i):
+    depth = 2
+    in_single = False
+    in_double = False
+    i += 3
+    while i < len(text) and depth > 0:
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            i += 1
+            continue
+        if not in_double and ch == "(":
+            depth += 1
+        elif not in_double and ch == ")":
+            depth -= 1
+        i += 1
+    return i
+
+
+def _has_unsafe_redirect(text):
+    in_single = False
+    in_double = False
+    i = 0
+    while i < len(text):
+        ch = text[i]
+        if in_single:
+            if ch == "'":
+                in_single = False
+            i += 1
+            continue
+        if ch == "\\":
+            i += 2
+            continue
+        if ch == "'" and not in_double:
+            in_single = True
+            i += 1
+            continue
+        if ch == '"':
+            in_double = not in_double
+            i += 1
+            continue
+        if in_double:
+            i += 1
+            continue
+        if ch == "<" and i + 1 < len(text) and text[i + 1] == "<":
+            i += 2
+            continue
+        if ch == "$" and text[i + 1:i + 3] == "((":
+            i = _skip_arithmetic(text, i)
+            continue
+        redirect = _redirect_at(text, i)
+        if redirect:
+            if not redirect["safe"]:
+                return True
+            i = redirect["next"] if redirect["next"] > i else i + 1
+            continue
+        i += 1
+    return False
+
+def _skip_sed_address(script, i):
+    def skip_one(k):
+        if k >= len(script):
+            return k
+        if script[k] == "$":
+            return k + 1
+        if script[k].isdigit():
+            j = k
+            while j < len(script) and script[j].isdigit():
+                j += 1
+            return j
+        if script[k] in "/\\":
+            delim = script[k + 1] if script[k] == "\\" and k + 1 < len(script) else "/"
+            if script[k] == "\\" and k + 1 >= len(script):
+                return k
+            j = k + (2 if script[k] == "\\" else 1)
+            while j < len(script) and script[j] != delim and script[j] != "\n":
+                if script[j] == "\\":
+                    j += 2
+                else:
+                    j += 1
+            if j < len(script) and script[j] == delim:
+                j += 1
+            return j
+        return k
+
+    nxt = skip_one(i)
+    if nxt == i:
+        return i
+    if nxt < len(script) and script[nxt] in ",~":
+        return skip_one(nxt + 1)
+    return nxt
+
+
+def _consume_transform(script, i):
+    if i + 1 >= len(script):
+        return {"index": i + 1, "writes": False}
+    delim = script[i + 1]
+    if delim.isspace() or delim == ";":
+        return {"index": i + 1, "writes": False}
+    k = i + 2
+
+    def find_delim():
+        nonlocal k
+        while k < len(script):
+            if script[k] == "\\" and k + 1 < len(script):
+                k += 2
+                continue
+            if script[k] == "\n":
+                return False
+            if script[k] == delim:
+                k += 1
+                return True
+            k += 1
+        return False
+
+    if not find_delim() or not find_delim():
+        return {"index": max(k, i + 1), "writes": False}
+    flags = []
+    while k < len(script) and script[k] not in " \t;\n":
+        flags.append(script[k])
+        k += 1
+    flag_text = "".join(flags)
+    if any(ch in flag_text for ch in "ewW"):
+        return {"index": k, "writes": True}
+    if _SED_FLAG_SPACE_RE.match(script[k:]):
+        return {"index": k, "writes": True}
+    return {"index": k, "writes": False}
+
+
+def _sed_script_writes(script):
+    i = 0
+    while i < len(script):
+        while i < len(script) and (script[i].isspace() or script[i] == ";"):
+            i += 1
+        if i >= len(script):
+            return False
+        if script[i] == "#":
+            while i < len(script) and script[i] != "\n":
+                i += 1
+            continue
+        i = _skip_sed_address(script, i)
+        while i < len(script) and script[i] in " \t":
+            i += 1
+        if i < len(script) and script[i] == "!":
+            i += 1
+            while i < len(script) and script[i] in " \t":
+                i += 1
+        if i >= len(script):
+            return False
+        cmd = script[i]
+        if cmd in "wWe":
+            return True
+        if cmd in "sy":
+            parsed = _consume_transform(script, i)
+            if parsed["writes"]:
+                return True
+            i = parsed["index"]
+            continue
+        if cmd in "{}":
+            i += 1
+            continue
+        if cmd == ":":
+            i += 1
+            while i < len(script) and script[i] not in " \t\n;{}":
+                i += 1
+            continue
+        if cmd in "aci":
+            i += 1
+            while i < len(script) and script[i] not in "\n;":
+                i += 1
+            continue
+        i += 1
+    return False
+
+
+def _sed_writes(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    saw_script = False
+    i = 0
+    while i < len(words):
+        token = words[i]
+        if token == "--":
+            if not saw_script and i + 1 < len(words) and _sed_script_writes(words[i + 1]):
+                return True
+            break
+        if token in ("--in-place", "--file") or token.startswith("--in-place=") or token.startswith("--file="):
+            return True
+        if token in ("-e", "--expression") or token.startswith("--expression="):
+            if token.startswith("--expression="):
+                script = token[len("--expression="):]
+            else:
+                i += 1
+                script = words[i] if i < len(words) else ""
+            saw_script = True
+            if script and _sed_script_writes(script):
+                return True
+            i += 1
+            continue
+        if token.startswith("--"):
+            i += 1
+            continue
+        if token.startswith("-") and len(token) > 1:
+            k = 1
+            while k < len(token):
+                letter = token[k]
+                if letter in "if":
+                    return True
+                if letter == "e":
+                    attached = token[k + 1:]
+                    if attached:
+                        script = attached
+                    else:
+                        i += 1
+                        script = words[i] if i < len(words) else ""
+                    saw_script = True
+                    if script and _sed_script_writes(script):
+                        return True
+                    break
+                k += 1
+            i += 1
+            continue
+        if not saw_script:
+            saw_script = True
+            if _sed_script_writes(token):
+                return True
+        i += 1
+    return False
+
+
+def _sort_writes(tokens):
+    for token in (_unquote_word(item) for item in tokens):
+        if token == "--output" or token.startswith("--output=") or _short_cluster_has(token, "o"):
+            return True
+    return False
+
+
+def _date_writes(tokens):
+    for token in (_unquote_word(item) for item in tokens):
+        if token.startswith("+"):
+            continue
+        if token == "--set" or token.startswith("--set=") or _short_cluster_has(token, "s"):
+            return True
+    return False
+
+
+def _awk_program_writes(program):
+    if _AWK_SYSTEM_RE.search(program):
+        return True
+    if _AWK_GETLINE_RE.search(program):
+        return True
+    no_parens = re.sub(r"\([^()]*\)", "", program)
+    if _AWK_PRINT_FILE_RE.search(no_parens) or _AWK_PRINT_PIPE_RE.search(no_parens):
+        return True
+    return False
+
+
+def _awk_writes(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    program = []
+    saw_program = False
+    i = 0
+    while i < len(words):
+        token = words[i]
+        if token == "--":
+            if not saw_program and i + 1 < len(words):
+                program.append(words[i + 1])
+            break
+        if token in ("-f", "--file") or token.startswith("--file=") or (token.startswith("-f") and not token.startswith("--")):
+            return True
+        if token in ("-e", "--source") or token.startswith("--source=") or (token.startswith("-e") and len(token) > 2 and not token.startswith("--")):
+            if token.startswith("--source="):
+                src = token[len("--source="):]
+            elif token.startswith("-e") and len(token) > 2:
+                src = token[2:]
+            else:
+                i += 1
+                src = words[i] if i < len(words) else ""
+            saw_program = True
+            program.append(src)
+            i += 1
+            continue
+        if token.startswith("-"):
+            if "=" not in token and token in ("-v", "-F", "-W", "--field-separator", "--assign"):
+                i += 1
+            i += 1
+            continue
+        if not saw_program:
+            saw_program = True
+            program.append(token)
+        i += 1
+    return _awk_program_writes("\n".join(program))
+
+
+def _find_writes(tokens):
+    return _FIND_WRITE_RE.search(" ".join(_unquote_word(token) for token in tokens)) is not None
+
+
+def _skip_options(words, arg_options):
+    i = 0
+    while i < len(words) and words[i].startswith("-"):
+        name = words[i].split("=", 1)[0]
+        if "=" not in words[i] and name in arg_options:
+            i += 2
+        else:
+            i += 1
+    return i
+
+
+def _ip_readonly(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    index = _skip_options(words, set())
+    if index >= len(words) or words[index] not in IP_OBJECTS:
+        return False
+    return all(word not in IP_WRITE for word in words[index + 1:])
+
+
+def _journalctl_readonly(tokens):
+    for token in (_unquote_word(item) for item in tokens):
+        if _VACUUM_RE.match(token) or token in ("--rotate", "--flush", "--relinquish-var"):
+            return False
+    return True
+
+
+def _systemctl_readonly(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    index = _skip_options(words, SYSTEMCTL_ARG)
+    return index < len(words) and words[index] in SYSTEMCTL_OK
+
+
+def _container_readonly(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    index = _skip_options(words, set(["-H", "--host", "-c", "--context", "-l", "--log-level"]))
+    if index >= len(words):
+        return False
+    sub = words[index]
+    if sub in DOCKER_DIRECT:
+        return True
+    if sub == "container":
+        return index + 1 < len(words) and words[index + 1] in ("ps", "ls", "logs", "inspect", "stats", "top", "port", "diff")
+    if sub == "image":
+        return index + 1 < len(words) and words[index + 1] in ("ls", "inspect")
+    return False
+
+
+def _kubectl_readonly(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    index = _skip_options(words, KUBE_ARG)
+    return index < len(words) and words[index] in KUBE_OK
+
+
+def _curl_readonly(tokens):
+    words = [_unquote_word(token) for token in tokens]
+    i = 0
+    while i < len(words):
+        token = words[i]
+        if token == "--":
+            i += 1
+            continue
+        if token in ("-o", "-O", "--output", "--remote-name", "--remote-name-all") or token.startswith("--output="):
+            return False
+        if token in ("-d", "-F", "--form", "--form-string", "-T", "--upload-file", "-I", "--head") or token.startswith("--data") or token.startswith("--form=") or token.startswith("--upload-file="):
+            return False
+        if token.startswith("-") and not token.startswith("--"):
+            cluster = token[1:]
+            if any(ch in cluster for ch in "oOdFTI"):
+                return False
+            if "X" in cluster:
+                attached = cluster[cluster.find("X") + 1:]
+                method = attached or (words[i + 1] if i + 1 < len(words) else "")
+                if not attached:
+                    i += 1
+                if method.upper() != "GET":
+                    return False
+            i += 1
+            continue
+        if token in ("-X", "--request") or token.startswith("--request="):
+            if token.startswith("--request="):
+                method = token[len("--request="):]
+            else:
+                i += 1
+                method = words[i] if i < len(words) else ""
+            if method.upper() != "GET":
+                return False
+        name = token.split("=", 1)[0]
+        if name in CURL_ARG and "=" not in token:
+            i += 1
+        i += 1
+    return True
+
+
+def _args_are_readonly(name, arg_tokens):
+    if name == "sed":
+        return not _sed_writes(arg_tokens)
+    if name == "sort":
+        return not _sort_writes(arg_tokens)
+    if name == "date":
+        return not _date_writes(arg_tokens)
+    if name in ("awk", "gawk"):
+        return not _awk_writes(arg_tokens)
+    if name == "find":
+        return not _find_writes(arg_tokens)
+    if name == "ip":
+        return _ip_readonly(arg_tokens)
+    if name == "journalctl":
+        return _journalctl_readonly(arg_tokens)
+    if name == "systemctl":
+        return _systemctl_readonly(arg_tokens)
+    if name in ("docker", "podman"):
+        return _container_readonly(arg_tokens)
+    if name == "kubectl":
+        return _kubectl_readonly(arg_tokens)
+    if name == "curl":
+        return _curl_readonly(arg_tokens)
+    return True
+
+
+def _evaluate_pipeline(inner):
+    text = str(inner or "")
+    if _has_unsafe_redirect(text):
+        return {"ok": False, "reason": "内部有输出重定向，会写文件"}
+    segments = _split_shell_segments(text)
+    if not segments:
+        return {"ok": False, "reason": "内部结构无法静态确认"}
+    saw_command = False
+    for segment in segments:
+        tokens = _shell_words(segment)
+        if not tokens:
+            continue
+        if _is_assignment(_unquote_word(tokens[0])):
+            return {"ok": False, "reason": "内部有前导环境变量赋值，不能自动放行"}
+        name = _trusted_readonly_name(tokens[0])
+        if not name:
+            shown = _unquote_word(tokens[0]).lstrip("(").rstrip(")") or tokens[0]
+            return {"ok": False, "reason": "内部命令 “%s” 不在只读白名单内" % shown}
+        saw_command = True
+        if not _args_are_readonly(name, tokens[1:]):
+            return {"ok": False, "reason": "内部 %s 带了会改系统或写文件的参数" % name}
+    if not saw_command:
+        return {"ok": False, "reason": "内部结构无法静态确认"}
+    return {"ok": True, "reason": "内部仅调用只读命令"}
+
+
+def _object_in(source):
+    source = str(source or "")
+    found = re.search(r"\bof\s*=\s*(?:\"([^\"]+)\"|'([^']+)'|(\S+))", source, re.I)
+    if found:
+        value = (found.group(1) or found.group(2) or found.group(3) or "").rstrip(");")
+        if value and value != "/dev/null":
+            return value
+    redir = re.search(r"(?:&>>|&>|>>|(?<!&)>)\s*(?:\"([^\"]+)\"|'([^']+)'|(/[^\s;&|]+))", source)
+    if redir:
+        target = redir.group(1) or redir.group(2) or redir.group(3)
+        if target and target != "/dev/null":
+            return target
+    paths = [
+        item.group(1)
+        for item in re.finditer(r"(?:^|[\s=])(/(?:[\w.+@=-]+/)*[\w.+@=-]+)", source)
+        if item.group(1) != "/dev/null"
+    ]
+    return paths[-1] if paths else None
+
+
+def _extract_target(text, finding):
+    match = str(finding.get("match") or "")
+    found = _object_in(match)
+    if found:
+        return found
+    start = max(0, finding.get("index") or 0)
+    line_end = text.find("\n", start)
+    if line_end < 0:
+        line = text[start:min(len(text), start + len(match) + 160)]
+    else:
+        line = text[start:line_end]
+    return _object_in(line)
+
+
+def _annotate_finding(text, finding):
+    finding["target"] = _extract_target(text, finding)
+    finding["impact"] = _impact_for(finding.get("category"))
+    return finding
+
+
+def analyze_command(text, depth=0):
+    """返回 {category, findings, substitutions, autoApproved}。"""
+    raw = str(text or "")
+    if depth > 8:
+        finding = _annotate_finding(raw, {
+            "tier": "dynamic",
+            "category": "动态变量或命令替换执行",
+            "match": raw[:120],
+            "index": 0,
+            "reason": "嵌套过深，无法静态确认",
+        })
+        return {"category": finding["category"], "findings": [finding], "substitutions": [], "autoApproved": []}
+    normalized = re.sub(r"\\\r?\n", " ", raw)
+    scanned = _scan_shell(normalized)
+    findings = _hard_findings(normalized, scanned["blanked"])
+    findings.extend(_db_client_findings(normalized))
+    pipe = PIPE_TO_SHELL.search(scanned["blanked"])
+    if pipe:
+        _push_finding(findings, {
+            "tier": "dynamic",
+            "category": "将编码或下载内容交给命令解释器执行",
+            "match": normalized[pipe.start():pipe.end()][:200],
+            "index": pipe.start(),
+            "reason": "命中把内容交给解释器执行的写法",
+        })
+    for pattern in DYNAMIC_ONLY:
+        match = pattern.search(scanned["blanked"])
+        if match:
+            _push_finding(findings, {
+                "tier": "dynamic",
+                "category": "动态变量或命令替换执行",
+                "match": normalized[match.start():match.end()],
+                "index": match.start(),
+                "reason": "命中 eval/source 或点号执行",
+            })
+    substitutions = []
+    for entry in scanned["substitutions"]:
+        nested = analyze_command(entry["inner"], depth + 1)
+        nested_hard = next((item for item in nested["findings"] if item["tier"] == "hard"), None)
+        item = dict(entry)
+        if nested_hard:
+            base = nested_hard["category"].replace("（命令替换内部）", "")
+            item["verdict"] = "blocked"
+            item["nestedCategory"] = base
+            item["reason"] = "命令替换内部命中高危规则：" + base
+        else:
+            verdict = _evaluate_pipeline(entry["inner"])
+            if not verdict["ok"] or nested["findings"]:
+                item["verdict"] = "blocked"
+                item["reason"] = "内部还有无法自动放行的命中" if verdict["ok"] else verdict["reason"]
+            else:
+                item["verdict"] = "readonly"
+                item["reason"] = verdict["reason"]
+        substitutions.append(item)
+    for substitution in substitutions:
+        if substitution["verdict"] != "blocked":
+            continue
+        base = substitution.get("nestedCategory")
+        _push_finding(findings, {
+            "tier": "hard" if base else "dynamic",
+            "category": (base + "（命令替换内部）") if base else "动态变量或命令替换执行",
+            "match": substitution["raw"],
+            "index": substitution["index"],
+            "reason": substitution["reason"],
+        })
+    masked = _mask_substitutions(normalized, substitutions)
+    findings.extend(_interpreter_findings(normalized, masked, depth))
+    findings.extend(_command_position_findings(normalized, masked, substitutions))
+    findings.sort(key=lambda finding: (finding["index"], finding["category"]))
+    seen = set()
+    unique = []
+    for finding in findings:
+        key = (finding["tier"], finding["category"], finding["index"])
+        if key in seen:
+            continue
+        seen.add(key)
+        unique.append(_annotate_finding(normalized, finding))
+    hard = next((item for item in unique if item["tier"] == "hard"), None)
+    return {
+        "category": hard["category"] if hard else (unique[0]["category"] if unique else None),
+        "findings": unique,
+        "substitutions": substitutions,
+        "autoApproved": [item for item in substitutions if item["verdict"] == "readonly"],
+    }
+
+
 def _collect_review(job, analysis):
-    """弹窗展示用的命中信息：优先用网关算好的结果，缺失再本地重算。"""
     review = job.get("safetyReview") or {}
-    findings = list(review.get("findings") or [])
+    review_findings = list(review.get("findings") or [])
+    local_findings = list((analysis or {}).get("findings") or [])
+    findings = local_findings if len(local_findings) > len(review_findings) else (review_findings or local_findings)
     auto = list(review.get("autoApproved") or [])
-    if not findings and analysis:
-        findings = list(analysis.get("findings") or [])
-    if not auto and analysis:
-        auto = list(analysis.get("autoApproved") or [])
-    return findings, auto
+    local_auto = list((analysis or {}).get("autoApproved") or [])
+    if len(local_auto) > len(auto):
+        auto = local_auto
+    elif not auto:
+        auto = local_auto
+    total = review.get("totalFindings")
+    if not isinstance(total, int) or total < len(findings):
+        total = len(findings)
+    return findings, auto, total
+
+
+def _escape_controls(text):
+    out = []
+    for ch in text:
+        code = ord(ch)
+        if ch in "\n\t":
+            out.append(ch)
+            continue
+        if code < 32 or code == 127 or 128 <= code <= 159 or 0x202A <= code <= 0x202E or 0x2066 <= code <= 0x2069:
+            out.append("\\u%04x" % code)
+            continue
+        out.append(ch)
+    return "".join(out)
+
+
+def _clip(text, limit):
+    text = str(text or "").strip()
+    if len(text) <= limit:
+        return text
+    return text[:limit] + "…"
+
+
+def _snippet(finding):
+    if finding.get("snippet"):
+        return str(finding.get("snippet")).replace("\r", " ").replace("\n", " ")[:160]
+    return str(finding.get("match") or "").lstrip("\r\n").replace("\r", " ").replace("\n", " ")[:160]
 
 
 def _highlight_spans(text, findings):
-    """把命中片段用【】圈出来。MessageBox 不支持富文本，只能靠符号突出。"""
     spans = []
     for finding in findings:
         raw = str(finding.get("match") or "")
-        if not raw:
-            continue
         index = finding.get("index")
-        start = index if isinstance(index, int) and index >= 0 and text[index:index + len(raw)] == raw else -1
-        if start < 0:
-            start = text.find(raw)
-        if start < 0:
+        if not raw or not isinstance(index, int) or index < 0:
             continue
-        spans.append((start, start + len(raw)))
+        if text[index:index + len(raw)] != raw:
+            continue
+        spans.append((index, index + len(raw)))
     spans.sort(reverse=True)
     last_start = None
     for start, end in spans:
         if last_start is not None and end > last_start:
-            continue  # 与已标记片段重叠，跳过以免嵌套
+            continue
         text = text[:start] + "【" + text[start:end] + "】" + text[end:]
         last_start = start
     return text
 
 
+def _excerpt(marked):
+    lines = marked.split("\n")
+    hot = set()
+    for index, line in enumerate(lines):
+        if "【" in line or "】" in line:
+            if index:
+                hot.add(index - 1)
+            hot.add(index)
+            if index + 1 < len(lines):
+                hot.add(index + 1)
+    if not hot:
+        chosen = lines[:2]
+        body = "\n".join(_trim_line(line) for line in chosen)
+        omitted = len(lines) - len(chosen)
+        if omitted > 0:
+            body += "\n…（其余 %d 行未展开）" % omitted
+        return body
+    parts = []
+    last = -2
+    for index in sorted(hot):
+        if last >= 0 and index > last + 1:
+            parts.append("…")
+        parts.append(_trim_line(lines[index]))
+        last = index
+    if len(parts) > 8:
+        parts = parts[:8] + ["…（其余命中行未展开）"]
+    return "\n".join(parts)
+
+
+def _trim_line(line):
+    if len(line) > 180:
+        return line[:180] + "…"
+    return line
+
+
+def _fit_message(text):
+    if len(text) <= DIALOG_CHAR_BUDGET and text.count("\n") + 1 <= DIALOG_LINE_BUDGET:
+        return text
+    start = text.find("\n---\n")
+    end = text.rfind("\n---\n")
+    if start < 0 or end <= start:
+        return text[:DIALOG_CHAR_BUDGET]
+    head = text[:start + 5]
+    foot = text[end:]
+    room = DIALOG_CHAR_BUDGET - len(head) - len(foot) - 20
+    body = text[start + 5:end]
+    if room < 40:
+        room = 40
+    if len(body) > room:
+        body = body[:room] + "\n…（命令摘录已截断）"
+    fitted = head + body + foot
+    lines = fitted.split("\n")
+    if len(lines) > DIALOG_LINE_BUDGET:
+        # 保留结尾说明，只压缩命令摘录。
+        overflow = len(lines) - DIALOG_LINE_BUDGET
+        body_lines = body.split("\n")
+        keep = max(1, len(body_lines) - overflow)
+        body = "\n".join(body_lines[:keep] + ["…（命令摘录已截断）"])
+        fitted = head + body + foot
+    return fitted
+
+
 def approval_message(job, analysis=None):
     action = job.get("action", {})
-    findings, auto = _collect_review(job, analysis)
+    findings, auto, total = _collect_review(job, analysis)
+    meta = metadata()
+    remote_address = str(meta.get("remoteAddress") or "未知主机")
+    session_path = str(meta.get("sessionPath") or "")
+    host_line = "目标主机：" + remote_address
+    if session_path:
+        host_line += "　会话：" + session_path
     if action.get("type") == "send":
         operation = "发送终端输入" + ("并按回车" if action.get("enter", False) else "（不按回车）")
         raw_input = str(action.get("text", ""))
-        marked = _highlight_spans(raw_input, findings) if findings else raw_input
-        exact_input = json.dumps(marked, ensure_ascii=False)
-        for codepoint in range(0x202A, 0x202F):
-            exact_input = exact_input.replace(chr(codepoint), "\\u" + format(codepoint, "04x"))
-        for codepoint in range(0x2066, 0x206A):
-            exact_input = exact_input.replace(chr(codepoint), "\\u" + format(codepoint, "04x"))
+        shown_findings = findings[:DIALOG_FINDING_LIMIT]
+        marked = _highlight_spans(raw_input, shown_findings) if shown_findings else raw_input
+        shown_input = _escape_controls(_excerpt(marked))
     else:
         operation = "发送 Ctrl+C 中断当前命令"
-        exact_input = "Ctrl+C"
-    remote_address = str(metadata().get("remoteAddress") or "未知主机")
-
+        shown_input = "Ctrl+C"
+        shown_findings = []
     header = ["AI Agent 请求执行一个终端操作。", ""]
     if findings:
-        header.append("⚠ 需要你重点确认：" + str(len(findings)) + " 处")
+        header.append("⚠ 需要你重点确认：" + str(total) + " 处")
         header.append("────────────────────────────")
-        for order, finding in enumerate(findings[:6], 1):
-            header.append(str(order) + ") 规则：" + str(finding.get("category")))
-            header.append("   片段：" + str(finding.get("match") or "")[:160])
-            reason = str(finding.get("reason") or "")
-            if reason:
-                header.append("   原因：" + reason)
-        if len(findings) > 6:
-            header.append("…… 另有 " + str(len(findings) - 6) + " 处命中")
+        for order, finding in enumerate(shown_findings, 1):
+            header.append("%d) 规则：%s" % (order, finding.get("category")))
+            header.append("   片段：" + _snippet(finding))
+            target = finding.get("target")
+            if target:
+                header.append("   对象：" + str(target))
+            impact = finding.get("impact") or _impact_for(finding.get("category"))
+            header.append("   后果：" + str(impact))
+        if total > len(shown_findings):
+            header.append("…… 另有 %d 处" % (total - len(shown_findings)))
         header.append("────────────────────────────")
         if auto:
-            header.append("另有 " + str(len(auto)) + " 处命令替换已解析为只读，未计入上表。")
-        header.append("其余命令部分未命中规则，可跳过不看。")
+            header.append("另有 %d 处命令替换未单独列入上表。" % len(auto))
         header.append("")
     elif auto:
-        header.append("命令含 " + str(len(auto)) + " 处命令替换，已解析：内部均为只读命令。")
+        header.append("命令含 %d 处命令替换，解析后未发现需要重点确认的命中。" % len(auto))
         header.append("")
-
-    rules_line = ""
-    if findings:
-        names = []
-        for finding in findings:
-            name = str(finding.get("category"))
-            if name not in names:
-                names.append(name)
-        rules_line = "命中规则：" + "、".join(names) + "\n\n"
-
-    # MessageBox 高度有限，超长命令会被截掉底部按钮；命中片段已在顶部单列，
-    # 这里只保证能看个大概。
-    shown_input = exact_input
-    if len(shown_input) > 2000:
-        shown_input = shown_input[:2000] + "…（已截断，原文共 %d 字符）" % len(exact_input)
-
-    return (
-        "\n".join(header) + "\n"
-        + "目标主机：" + remote_address + "\n"
-        "Agent：" + str(job.get("agentId", "unknown-agent")) + "\n"
-        "操作：" + operation + "\n"
-        "风险等级：" + RISK_LABELS.get(str(action.get("riskLevel", "")), "未说明") + "\n\n"
-        "为什么要做：\n" + str(action.get("explanation", "")) + "\n\n"
-        "预期结果：\n" + str(action.get("expectedOutcome", "")) + "\n\n"
-        "完整命令（【】内为需要你确认的片段，反斜杠表示转义字符）：\n---\n" + shown_input + "\n---\n\n"
-        + rules_line
-        + "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。"
-    )
+    command_label = "命令（【】内为需要确认的片段；长命令只展示命中行及其相邻一行）：" if action.get("type") == "send" else "输入："
+    message = "\n".join(header) + "\n" + "\n".join([
+        host_line,
+        "Agent：" + str(job.get("agentId", "unknown-agent")),
+        "操作：" + operation,
+        "风险等级：" + RISK_LABELS.get(str(action.get("riskLevel", "")), "未说明"),
+        "",
+        "为什么要做：",
+        _clip(action.get("explanation", ""), DIALOG_FIELD_LIMIT),
+        "",
+        "预期结果：",
+        _clip(action.get("expectedOutcome", ""), DIALOG_FIELD_LIMIT),
+        "",
+        command_label,
+        "---",
+        shown_input,
+        "---",
+        "",
+        "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。",
+    ])
+    return _fit_message(message)
 
 
 def request_user_approval(job, analysis=None):
@@ -511,336 +2093,6 @@ def request_user_approval(job, analysis=None):
         return int(xsh.Dialog.MessageBox(approval_message(job, analysis), "Xshell Agent Bridge 安全确认", 4)) == 6
     except Exception as error:
         raise RuntimeError("无法显示 Xshell 安全确认框，已拒绝执行：" + str(error))
-
-
-# ---------------------------------------------------------------------------
-# 命令体检：解析 $( ) 与反引号内部内容，只读的自动放行，其余交人工确认。
-# 规则必须与 src/core.mjs 的 analyzeCommand 保持一致，否则会出现网关放行、
-# 脚本又弹窗（或反之）的不一致。
-# ---------------------------------------------------------------------------
-
-READONLY_COMMANDS = frozenset((
-    "cat", "head", "tail", "grep", "egrep", "fgrep", "awk", "gawk", "sed", "cut", "tr",
-    "sort", "uniq", "wc", "ls", "df", "du", "free", "ps", "pgrep", "pidof",
-    "pwd", "whoami", "id", "uname", "date", "stat", "readlink", "realpath",
-    "basename", "dirname", "echo", "printf", "test", "expr", "true", "false", "seq",
-    "column", "lsblk", "lscpu", "nproc", "uptime", "which", "type", "printenv", "find",
-))
-
-# 会把这些只读工具变成写操作参数。
-WRITE_FLAGS = {
-    "sort": re.compile(r"(?:^|\s)(?:-o|--output)(?:\s|=|$)"),
-    "date": re.compile(r"(?:^|\s)(?:-s|--set)(?:\s|=|$)"),
-    "sed": re.compile(r"(?:^|\s)-i|--in-place"),
-    "find": re.compile(r"(?:^|\s)(?:-delete|-exec|-execdir|-ok|-okdir|-fprint\w*|-fls)\b"),
-    "awk": re.compile(r"system\s*\(|print\s*\|"),
-    "gawk": re.compile(r"system\s*\(|print\s*\|"),
-    "ls": re.compile(r"(?:^|\s)--?R\b"),
-}
-
-# 文本级解释器检测（保留原有两条规则）；命令替换那条改由结构解析处理。
-INTERPRETER_PATTERNS = DYNAMIC_EXECUTION_PATTERNS[:2]
-DYNAMIC_ONLY_PATTERNS = (
-    ("动态变量或命令替换执行", re.compile(r"(?:^|[\r\n;&|]\s*)(?:eval|source)\b", re.I)),
-    ("动态变量或命令替换执行", re.compile(r"(?:^|[\r\n;&|]\s*)\.\s+", re.I)),
-)
-_ASSIGN_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
-_SUBST_HEAD_RE = re.compile(r"^_{9,}")
-_VAR_HEAD_RE = re.compile(r"^\$\{?[A-Za-z_]")
-
-
-def _split_shell_segments(text):
-    """按 ; & | 换行切段，跳过引号内与转义字符。"""
-    segments = []
-    buffer = ""
-    in_single = False
-    in_double = False
-    i = 0
-    length = len(text)
-    while i < length:
-        ch = text[i]
-        if ch == "\\":
-            buffer += text[i:i + 2]
-            i += 2
-            continue
-        if in_single:
-            buffer += ch
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if ch == "'" and not in_double:
-            in_single = True
-            buffer += ch
-            i += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            buffer += ch
-            i += 1
-            continue
-        if not in_double and ch in ";&|\n":
-            segments.append(buffer)
-            buffer = ""
-            while i < length and text[i] in ";&|\n":
-                i += 1
-            continue
-        buffer += ch
-        i += 1
-    if buffer.strip():
-        segments.append(buffer)
-    return segments
-
-
-def _first_command(tokens):
-    """跳过前导 VAR=value 赋值，返回 (命令名, 参数串, 位置)。"""
-    index = 0
-    while index < len(tokens) and _ASSIGN_RE.match(tokens[index]):
-        index += 1
-    if index >= len(tokens):
-        return None, "", index
-    name = tokens[index].split("/")[-1].strip("\"'").lower()
-    return name, " ".join(tokens[index + 1:]), index
-
-
-def _is_readonly_pipeline(inner):
-    cleaned = re.sub(r"\d?>&\d", " ", str(inner or "")).replace("&>", " ")
-    if re.search(r">>?", cleaned):
-        return False
-    segments = _split_shell_segments(cleaned)
-    if not segments:
-        return False
-    for segment in segments:
-        tokens = segment.strip().split()
-        if not tokens:
-            continue
-        name, args, _ = _first_command(tokens)
-        if name is None:
-            continue
-        if name not in READONLY_COMMANDS:
-            return False
-        flag = WRITE_FLAGS.get(name)
-        if flag and flag.search(args):
-            return False
-    return True
-
-
-def _extract_substitutions(text):
-    """找出所有 $(...) 与 `...`，处理嵌套、引号与转义。"""
-    found = []
-    i = 0
-    length = len(text)
-    in_single = False
-    in_double = False
-    while i < length:
-        ch = text[i]
-        if ch == "\\":
-            i += 2
-            continue
-        if in_single:
-            if ch == "'":
-                in_single = False
-            i += 1
-            continue
-        if ch == "'" and not in_double:
-            in_single = True
-            i += 1
-            continue
-        if ch == '"' and not in_single:
-            in_double = not in_double
-            i += 1
-            continue
-        if ch == "$" and i + 1 < length and text[i + 1] == "(":
-            start = i
-            depth = 1
-            j = i + 2
-            single = False
-            double = False
-            while j < length and depth > 0:
-                inner_ch = text[j]
-                if inner_ch == "\\":
-                    j += 2
-                    continue
-                if single:
-                    if inner_ch == "'":
-                        single = False
-                    j += 1
-                    continue
-                if inner_ch == "'" and not double:
-                    single = True
-                    j += 1
-                    continue
-                if inner_ch == '"' and not single:
-                    double = not double
-                    j += 1
-                    continue
-                if inner_ch == "(":
-                    depth += 1
-                elif inner_ch == ")":
-                    depth -= 1
-                j += 1
-            end = j if depth == 0 else length
-            found.append({
-                "kind": "command",
-                "raw": text[start:end],
-                "inner": text[start + 2:max(start + 2, end - 1)],
-                "index": start,
-            })
-            i = end
-            continue
-        if ch == "`":
-            start = i
-            j = i + 1
-            while j < length:
-                if text[j] == "\\":
-                    j += 2
-                    continue
-                if text[j] == "`":
-                    break
-                j += 1
-            end = min(j + 1, length)
-            found.append({
-                "kind": "backtick",
-                "raw": text[start:end],
-                "inner": text[start + 1:j],
-                "index": start,
-            })
-            i = end
-            continue
-        i += 1
-    return found
-
-
-def _describe_reject(inner):
-    for segment in _split_shell_segments(str(inner or "")):
-        tokens = segment.strip().split()
-        if not tokens:
-            continue
-        name, args, _ = _first_command(tokens)
-        if name is None:
-            continue
-        if name not in READONLY_COMMANDS:
-            return "内部命令 “%s” 不在只读白名单内" % name
-        flag = WRITE_FLAGS.get(name)
-        if flag and flag.search(args):
-            return "内部 %s 带了会写文件的参数" % name
-    if re.search(r">>?", re.sub(r"\d?>&\d", " ", str(inner or ""))):
-        return "内部有输出重定向，会写文件"
-    return "内部结构无法静态确认"
-
-
-def analyze_command(text):
-    """返回 {category, findings, substitutions, autoApproved}。"""
-    normalized = re.sub(r"\\\r?\n", " ", str(text or ""))
-    findings = []
-
-    for category, pattern in HARD_BLOCKED_INPUT_PATTERNS:
-        match = pattern.search(normalized)
-        if match:
-            findings.append({
-                "tier": "hard", "category": category, "match": match.group(0),
-                "index": match.start(), "reason": "命中高危命令特征",
-            })
-
-    for category, pattern in INTERPRETER_PATTERNS:
-        match = pattern.search(normalized)
-        if match:
-            findings.append({
-                "tier": "dynamic", "category": category, "match": match.group(0)[:200],
-                "index": match.start(), "reason": "命中把内容交给解释器执行的写法",
-            })
-
-    substitutions = []
-    for entry in _extract_substitutions(normalized):
-        nested = analyze_command(entry["inner"])
-        nested_hard = next((f for f in nested["findings"] if f["tier"] == "hard"), None)
-        item = dict(entry)
-        if nested_hard:
-            base = nested_hard["category"].replace("（命令替换内部）", "")
-            item["verdict"] = "blocked"
-            item["nested_category"] = base
-            item["reason"] = "命令替换内部命中高危规则：" + base
-        elif not _is_readonly_pipeline(entry["inner"]):
-            item["verdict"] = "blocked"
-            item["reason"] = _describe_reject(entry["inner"])
-        else:
-            item["verdict"] = "readonly"
-            item["reason"] = "内部仅调用只读命令"
-        substitutions.append(item)
-
-    for item in substitutions:
-        if item["verdict"] != "blocked":
-            continue
-        base = item.get("nested_category")
-        findings.append({
-            "tier": "hard" if base else "dynamic",
-            "category": (base + "（命令替换内部）") if base else "动态变量或命令替换执行",
-            "match": item["raw"],
-            "index": item["index"],
-            "reason": item["reason"],
-        })
-
-    # 命令位置检查：替换结果或变量被直接当作命令执行时，实际命令静态不可知。
-    masked = normalized
-    for item in sorted(substitutions, key=lambda x: x["index"], reverse=True):
-        placeholder = "_" * max(9, len(item["raw"]))
-        masked = masked[:item["index"]] + placeholder + masked[item["index"] + len(item["raw"]):]
-    cursor = 0
-    for segment in _split_shell_segments(masked):
-        segment_start = masked.find(segment, cursor)
-        if segment_start >= 0:
-            cursor = segment_start + len(segment)
-        segment_start = max(0, segment_start)
-        tokens = segment.strip().split()
-        if not tokens:
-            continue
-        name, _args, index = _first_command(tokens)
-        if name is None or index >= len(tokens):
-            continue
-        head = tokens[index].strip("\"'")
-        covered = any(
-            item["verdict"] == "blocked" and abs(item["index"] - segment_start) <= 2
-            for item in substitutions
-        )
-        if _SUBST_HEAD_RE.match(head):
-            if not covered:
-                findings.append({
-                    "tier": "dynamic", "category": "动态变量或命令替换执行",
-                    "match": "$( ... )", "index": segment_start,
-                    "reason": "命令替换的结果被直接当作命令执行",
-                })
-        elif _VAR_HEAD_RE.match(head):
-            findings.append({
-                "tier": "dynamic", "category": "动态变量或命令替换执行",
-                "match": head[:120], "index": segment_start,
-                "reason": "变量被当作命令执行，真正执行的命令静态不可知",
-            })
-
-    for category, pattern in DYNAMIC_ONLY_PATTERNS:
-        match = pattern.search(normalized)
-        if match:
-            findings.append({
-                "tier": "dynamic", "category": category, "match": match.group(0),
-                "index": match.start(), "reason": "命中 eval/source 或点号执行",
-            })
-
-    findings.sort(key=lambda f: f["index"])
-    seen = set()
-    unique = []
-    for finding in findings:
-        key = (finding["tier"], finding["category"], finding["index"])
-        if key in seen:
-            continue
-        seen.add(key)
-        unique.append(finding)
-
-    hard = next((f for f in unique if f["tier"] == "hard"), None)
-    return {
-        "category": hard["category"] if hard else (unique[0]["category"] if unique else None),
-        "findings": unique,
-        "substitutions": substitutions,
-        "autoApproved": [s for s in substitutions if s["verdict"] == "readonly"],
-    }
 
 
 def hard_blocked_operation(text):

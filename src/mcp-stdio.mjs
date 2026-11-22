@@ -10,7 +10,7 @@ const MCP_INSTANCE_ID = randomUUID();
 const SAFETY_MODE = parseSafetyMode(process.env.XSHELL_SAFETY_MODE);
 const SEND_POLICY = {
   safe: 'safe 模式下，普通输入需要 Xshell 本地确认，识别出的破坏性命令及动态解释器执行会直接拒绝。不得通过脚本、编码、别名或拆分命令绕过拦截；确有需要时由用户在 Xshell 中亲自输入。',
-  normal: 'normal 模式下，普通输入直接发送，识别出的危险命令及标为高风险或严重风险的输入需要 Xshell 本地确认。',
+  normal: 'normal 模式下，普通输入直接发送。已证明只读的命令替换、纯算术扩展，以及无代码参数的解释器版本查询可以直接发送；识别出的危险命令、无法确认为只读的替换、引号内仍会执行的 SQL，以及标为高风险或严重风险的输入需要 Xshell 本地确认。',
   full: 'full 模式下，终端输入跳过危险命令检查和 Xshell 本地弹窗，发送前仍须获得用户对操作的明确授权。',
 }[SAFETY_MODE];
 const INTERRUPT_POLICY = SAFETY_MODE === 'full' ? '直接发送 Ctrl+C。' : 'Xshell 会弹窗确认 Ctrl+C。';
