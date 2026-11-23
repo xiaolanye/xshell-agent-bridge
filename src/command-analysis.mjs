@@ -1377,13 +1377,32 @@ function evaluatePipeline(inner) {
 
 const UNSAFE_TARGET_CHARS = /[$`"';&|<>()\\*?[\]{}#!~]/;
 
+function commandSegmentAt(text, index) {
+  if (index < 0 || index >= text.length) return '';
+  const rest = text.slice(index);
+  const cut = rest.search(/[;&|\n]/);
+  return (cut < 0 ? rest : rest.slice(0, cut)).trim();
+}
+
 function annotateFinding(text, finding) {
-  const nested = /^\$\((rm [^()]+)\)$/.exec(finding.match);
-  const words = shellWords(nested ? nested[1] : finding.match);
+  const base = String(finding.match || '');
+  const at = Number.isInteger(finding.index) ? finding.index : text.indexOf(base);
+  // 带引号的参数不会进入 finding.match（例如 rm "路径"），
+  // 所以从命中位置取到分隔符为止的整段命令来解析参数。
+  const segment = commandSegmentAt(text, at);
+  const head = base.trim().split(/\s+/)[0];
+  const source = segment && head && segment.startsWith(head) && segment.length > base.length ? segment : base;
+  const nested = /^\$\((rm [^()]+)\)$/.exec(source);
+  // shellWords 会保留外层引号，先去掉再判断是不是路径。
+  const unquote = (word) => {
+    const quoted = /^"([\s\S]*)"$/.exec(word) || /^'([\s\S]*)'$/.exec(word);
+    return quoted ? quoted[1] : word;
+  };
+  const words = shellWords(nested ? nested[1] : source).map(unquote);
   // 路径里可能含中文或空格之外的常见字符，只要不含 shell 元字符就认为是可读对象。
   const looksLikeTarget = (word) => !word.startsWith('-') && !UNSAFE_TARGET_CHARS.test(word);
   const simpleDelete = finding.category.startsWith('文件删除或内容清空') && words[0] === 'rm'
-    && finding.match.length < 200 && words.slice(1).every((word) => /^-[rRfidv]+$/.test(word) || looksLikeTarget(word));
+    && source.length < 200 && words.slice(1).every((word) => /^-[rRfidv]+$/.test(word) || looksLikeTarget(word));
   finding.target = simpleDelete ? words.slice(1).filter((word) => !word.startsWith('-')).join('、') || null : null;
   finding.impact = impactFor(finding.category);
   return finding;

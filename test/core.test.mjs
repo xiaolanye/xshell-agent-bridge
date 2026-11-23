@@ -36,6 +36,9 @@ test('extracts the target path of a delete command, including Chinese names', ()
   assert.equal(plain.findings[0].target, '/tmp/x');
   const chinese = analyzeCommand('rm -rf /tmp/测试删除_probe');
   assert.equal(chinese.findings[0].target, '/tmp/测试删除_probe');
+  // 路径带引号时，命中片段只到 rm，参数需要从整段命令里取
+  const quoted = analyzeCommand('rm -rf "/tmp/测试删除_probe"');
+  assert.equal(quoted.findings[0].target, '/tmp/测试删除_probe');
   // 变量无法静态解析，保持 null
   assert.equal(analyzeCommand('rm -rf $HOME').findings[0].target, null);
 });
