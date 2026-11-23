@@ -31,6 +31,15 @@ test('attaches deobfuscated text so the dialog can show the real command', () =>
   assert.match(job.safetyReview.category, /删除/);
 });
 
+test('extracts the target path of a delete command, including Chinese names', () => {
+  const plain = analyzeCommand('rm -rf /tmp/x');
+  assert.equal(plain.findings[0].target, '/tmp/x');
+  const chinese = analyzeCommand('rm -rf /tmp/测试删除_probe');
+  assert.equal(chinese.findings[0].target, '/tmp/测试删除_probe');
+  // 变量无法静态解析，保持 null
+  assert.equal(analyzeCommand('rm -rf $HOME').findings[0].target, null);
+});
+
 test('applies each MCP safety mode independently in the same session queue', () => {
   const core = new XshellBridgeCore();
   core.register({
