@@ -22,6 +22,15 @@ const interruptAction = () => ({
   riskLevel: 'low',
 });
 
+test('attaches deobfuscated text so the dialog can show the real command', () => {
+  const core = new XshellBridgeCore();
+  core.register({ bridgeId: 'shared', metadata: { ...approvalMetadata, safetyModesProtocol: SAFETY_MODES_PROTOCOL } });
+  const job = core.submitJob('shared', { agentId: 'normal', action: sendAction("$(printf '\\162\\155') -rf /tmp/x"), safetyMode: 'normal' });
+  assert.equal(job.confirmationRequired, true);
+  assert.match(job.safetyReview.restored, /rm -rf \/tmp\/x/);
+  assert.match(job.safetyReview.category, /删除/);
+});
+
 test('applies each MCP safety mode independently in the same session queue', () => {
   const core = new XshellBridgeCore();
   core.register({

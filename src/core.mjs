@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { analyzeCommand, buildSafetyReview } from './command-analysis.mjs';
+import { analyzeCommand, buildSafetyReview, deobfuscate } from './command-analysis.mjs';
 import { parseSafetyMode } from './safety-mode.mjs';
 
 export { analyzeCommand, buildSafetyReview };
@@ -176,6 +176,12 @@ export class XshellBridgeCore {
       const analysis = safetyMode === 'full' ? null : analyzeCommand(action.text);
       const category = analysis?.category || null;
       safetyReview = buildSafetyReview(analysis);
+      // 把转义还原后的可读文本一并带给确认框，方便人工核对真实命令。
+      const restored = deobfuscate(action.text);
+      if (restored !== action.text) {
+        safetyReview = safetyReview || { category: null, totalFindings: 0, findings: [], autoApproved: [] };
+        safetyReview.restored = restored.slice(0, 2000);
+      }
       if (safetyMode === 'safe' && category) {
         throw new BridgeError(
           `企业安全模式已禁止 Agent 执行“${category}”操作。即使用户愿意确认，桥接程序也不会发送；如确有需要，请用户在 Xshell 中亲自输入。`,

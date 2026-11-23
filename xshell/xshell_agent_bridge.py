@@ -2085,6 +2085,15 @@ def approval_message(job, analysis=None, include_state=False):
         lines.append("命令含 %d 处命令替换，解析后未发现需要重点确认的命中。" % len(auto))
     command_label = "命令（【】内为需要确认的片段；长命令只展示命中行及其相邻一行）：" if action.get("type") == "send" else "输入："
     lines.extend(["", command_label, "---", shown_input, "---"])
+    restored = (job.get("safetyReview") or {}).get("restored")
+    if restored and str(restored) != raw_input:
+        lines.extend([
+            "",
+            "还原后的内容（仅供阅读，实际发送的是上面那段）：",
+            "---",
+            _escape_controls(_clip(str(restored), DIALOG_FIELD_LIMIT * 4)),
+            "---",
+        ])
     message = _escape_controls(_fit_message("\n".join(lines)))
     excerpted = action.get("type") == "send" and (_excerpt(marked) != marked or message.find("\n---\n" + shown_input + "\n---\n") < 0)
     return (message, excerpted) if include_state else message
