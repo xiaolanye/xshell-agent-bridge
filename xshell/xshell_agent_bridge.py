@@ -392,6 +392,8 @@ DIALOG_FINDING_LIMIT = 3
 DIALOG_FIELD_LIMIT = 120
 DIALOG_LINE_BUDGET = 48
 DIALOG_CHAR_BUDGET = 1600
+# 超过这个长度才分页显示完整输入，避免普通命令弹两次。
+DIALOG_INLINE_LIMIT = 1200
 
 
 def _impact_for(category):
@@ -2091,11 +2093,12 @@ def approval_message(job, analysis=None, include_state=False):
             "",
             "还原后的内容（仅供阅读，实际发送的是上面那段）：",
             "---",
-            _escape_controls(_clip(str(restored), DIALOG_FIELD_LIMIT * 4)),
+            _escape_controls(_clip(str(restored), 300)),
             "---",
         ])
     message = _escape_controls(_fit_message("\n".join(lines)))
-    excerpted = action.get("type") == "send" and (_excerpt(marked) != marked or message.find("\n---\n" + shown_input + "\n---\n") < 0)
+    # 只有命令本身过长才分页；不再靠字符串反查判断，避免误判成二次确认。
+    excerpted = action.get("type") == "send" and len(raw_input) > DIALOG_INLINE_LIMIT
     return (message, excerpted) if include_state else message
 
 
@@ -2107,7 +2110,7 @@ def request_user_approval(job, analysis=None):
             return int(xsh.Dialog.MessageBox(message, title, 4)) == 6
         # Yes opens the full input, No rejects, Cancel rejects. Approval is
         # requested only on the final page to keep every dismissal fail-closed.
-        message = message + "\n\n是：查看完整输入后确认。否：拒绝。"
+        # 只有超长输入才分页；每页只显示内容，不再附加提示语。
         if int(xsh.Dialog.MessageBox(message, title, 4)) != 6:
             return False
         remaining = _escape_controls(job["action"]["text"])
@@ -2116,8 +2119,7 @@ def request_user_approval(job, analysis=None):
             lines = remaining[:size].splitlines(True)
             size = sum(len(line) for line in lines[:24])
             page, remaining = remaining[:size], remaining[size:]
-            prompt = "是：查看下一页。否：拒绝。" if remaining else "是：同意发送以上各页完整输入。否：拒绝。"
-            if int(xsh.Dialog.MessageBox(page + "\n\n" + prompt, title, 4)) != 6:
+            if int(xsh.Dialog.MessageBox(page, title, 4)) != 6:
                 return False
         return True
     except Exception as error:
@@ -2182,10 +2184,6 @@ def execute_job(job):
         else:
             xsh.Screen.Send(chr(3))
         result["acceptedByXshell"] = True
-        # 自证字段：脚本实际持有的文本按 UTF-8 转 hex。
-        # 若中文被读错，这里会直接体现（例如“甲乙丙”应为 e794b2e4b999e4b899）。
-        if action_type == "send":
-            result["textBytes"] = action.get("text", "").encode("utf-8", "replace").hex()[:120]
         # 给回显和首批输出一点时间落到屏幕上，再让主循环抓新图。
         if SETTLE_MS > 0:
             try:
