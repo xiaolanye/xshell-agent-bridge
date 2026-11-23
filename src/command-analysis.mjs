@@ -1385,8 +1385,70 @@ function annotateFinding(text, finding) {
   return finding;
 }
 
+const PRINTF_SUBSTITUTION = /\$\(\s*printf\s+(['"])([\s\S]*?)\1\s*\)/g;
+const ANSI_C_STRING = /\$'([^']*)'/g;
+const UNISTR_CALL = /unistr\s*\(\s*'([^']*)'\s*\)/gi;
+const MYSQL_CONVERT_HEX = /convert\s*\(\s*0x([0-9a-fA-F]+)\s+using\s+\w+\s*\)/gi;
+
+// 把 printf/ANSI-C 转义还原成真实字节，再按 UTF-8 解出文本。
+// 目的是让“用转义伪装”的命令在分析阶段现出原形，
+// 例如 $(printf '\162\155') 实际执行的是 rm。
+function decodeEscapeBytes(input) {
+  const bytes = [];
+  for (let i = 0; i < input.length; i += 1) {
+    const ch = input[i];
+    if (ch !== '\\') {
+      bytes.push(...Buffer.from(ch, 'utf8'));
+      continue;
+    }
+    const rest = input.slice(i + 1);
+    let match;
+    if ((match = /^[0-7]{1,3}/.exec(rest))) {
+      bytes.push(parseInt(match[0], 8) & 0xff);
+      i += match[0].length;
+      continue;
+    }
+    if ((match = /^x([0-9a-fA-F]{1,2})/.exec(rest))) {
+      bytes.push(parseInt(match[1], 16));
+      i += match[0].length;
+      continue;
+    }
+    const simple = { n: 10, r: 13, t: 9, '\\': 92, "'": 39, '"': 34 }[rest[0]];
+    if (simple !== undefined) {
+      bytes.push(simple);
+      i += 1;
+      continue;
+    }
+    bytes.push(92);
+  }
+  return Buffer.from(bytes).toString('utf8');
+}
+
+function quoteLiteral(text) {
+  return `'${String(text).replace(/'/g, "''")}'`;
+}
+
+// 分析前先反混淆：把 $(printf ...)、$'...'、unistr(...)、CONVERT(0x..) 还原成明文。
+// 只影响分析结果，不改变真正发送的内容。
+export function deobfuscate(text) {
+  let out = String(text || '');
+  for (let round = 0; round < 3; round += 1) {
+    const before = out;
+    out = out.replace(PRINTF_SUBSTITUTION, (whole, quote, body) => decodeEscapeBytes(body));
+    out = out.replace(ANSI_C_STRING, (whole, body) => decodeEscapeBytes(body));
+    out = out.replace(UNISTR_CALL, (whole, body) => quoteLiteral(
+      body.replace(/\\([0-9a-fA-F]{4})/g, (m, hex) => String.fromCharCode(parseInt(hex, 16))),
+    ));
+    out = out.replace(MYSQL_CONVERT_HEX, (whole, hex) => quoteLiteral(
+      Buffer.from(hex, 'hex').toString('utf8'),
+    ));
+    if (out === before) break;
+  }
+  return out;
+}
+
 export function analyzeCommand(text, depth = 0) {
-  const raw = String(text || '');
+  const raw = depth === 0 ? deobfuscate(String(text || '')) : String(text || '');
   if (depth > 8) {
     const finding = annotateFinding(raw, {
       tier: 'dynamic',

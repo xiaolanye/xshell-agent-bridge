@@ -389,6 +389,20 @@ test('blocks substitutions and variables that end up in command position', () =>
   assert.equal(analyzeCommand('P=$(cat /tmp/x); echo $P').category, null);
 });
 
+test('deobfuscates printf escapes before analysis', () => {
+  // $(printf '\162\155') 等价于 rm，不能因为内层是 printf 就放行
+  assert.notEqual(analyzeCommand("$(printf '\\162\\155') -rf /tmp/x").category, null);
+  // $'...' 形式的 ANSI-C 转义同样要还原
+  assert.notEqual(analyzeCommand("$'\\162\\155' -rf /tmp/x").category, null);
+  // 十六进制转义
+  assert.notEqual(analyzeCommand("$(printf '\\x72\\x6d') -rf /tmp/x").category, null);
+});
+
+test('unistr and CONVERT literals stay benign after deobfuscation', () => {
+  assert.equal(analyzeCommand("select unistr('\\7532\\4E59') from dual;").category, null);
+  assert.equal(analyzeCommand('select convert(0xE794B2 using utf8mb4) from dual;').category, null);
+});
+
 test('ignores a substitution inside single quotes because the shell does not expand it', () => {
   const analysis = analyzeCommand("echo '$(date +%F)'");
   assert.equal(analysis.category, null);
