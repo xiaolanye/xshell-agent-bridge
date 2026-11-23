@@ -14,7 +14,7 @@ const SEND_POLICY = {
   full: 'full 模式下，终端输入跳过危险命令检查和 Xshell 本地弹窗，发送前仍须获得用户对操作的明确授权。',
 }[SAFETY_MODE];
 const INTERRUPT_POLICY = SAFETY_MODE === 'full' ? '直接发送 Ctrl+C。' : 'Xshell 会弹窗确认 Ctrl+C。';
-const RESULT_POLICY = '发送后最多等待 3 秒，观察 shell 提示符是否回到屏幕。返回的 promptDetected=false 表示没等到，命令可能仍在执行，必须先用 xshell_read_screen 或 xshell_wait_for 复核，不要直接发送下一条。判据基于屏幕文本，存在误报可能：如果命令输出恰好打印出与提示符同形的一行（相同前缀且以 # $ > 结尾），可能被提前判为结束，请结合本次命令的输出自行判断，有疑问就读屏复核。注意：Xshell 的 Send 会把非 ASCII 字符做 UTF-8→GBK 的二次转换，直接发送中文会变成乱码（读取显示正常，只有发送受影响）。因此发送含中文的内容时必须改用 ASCII 转义：Oracle SQL 用 unistr(\'\\XXXX\')，shell 命令用 printf \'\\ooo\'（可在主机上执行 python tools.py esc 中文 生成两种写法）。尽量使用非交互式命令（mysql -e "..."、sqlplus -S 配合 here-doc 并在末尾 exit、redis-cli 单条命令）；若必须进入 mysql> / SQL> / redis-cli 交互会话，请预期每条命令都要等到超时后再由你主动轮询结果。';
+const RESULT_POLICY = '发送后最多等 3 秒看提示符；promptDetected=false 表示可能未结束，先 read_screen 复核再发下一条。中文可直接发送，脚本会自动转义。尽量用非交互式写法。';
 const PROTOCOL_VERSION = '2025-06-18';
 const downloadManager = new SftpDownloadManager();
 const uploadManager = new SftpUploadManager();

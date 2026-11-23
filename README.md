@@ -253,3 +253,17 @@ npm start         # 启动守护进程
 npm run mcp       # 以 MCP stdio 方式启动
 npm run demo:bridge # 运行模拟 Xshell 演示
 ```
+
+## 已知限制与中文处理
+
+**发送非 ASCII 会被 Xshell 破坏。** `xsh.Screen.Send` 对字符串做一次有损转换（UTF-8 字节按 GBK 解码，落单字节被替换成 `?`），因此直接发送中文会变成 `鐢蹭箼涓?` 这类乱码；该接口也不接受 bytes，无法绕过。
+
+脚本在发送前自动改写：
+
+- Oracle（提示符匹配 `SQL>`）：字符串字面量改写为 `unistr` 形式，参数是 Unicode 码点的十六进制转义
+- shell：每个中文字符改写为 `$(printf ...)` 的八进制转义
+- 纯 ASCII 原样通过；单引号不成对时跳过改写
+
+配置 `bridge.autoEscapeNonAscii`（默认 `true`）可关闭。读取方向不受影响，中文输出始终正常。
+
+**完成判定基于屏幕文本。** 发送后最多等 `bridge.waitForPromptMs`（默认 3000ms），等屏幕最后一行回到发送前的提示符。返回的 `promptDetected=false` 表示没等到，命令可能仍在执行，应先 `xshell_read_screen` 复核。判据存在误报可能：命令输出恰好打印出与提示符同形的行时会被当作结束。交互式客户端（mysql、sqlplus、redis-cli）与改变提示符的命令（cd、su、ssh）通常都会走到超时，属正常现象。
