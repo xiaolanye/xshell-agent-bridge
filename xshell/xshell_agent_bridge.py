@@ -2043,10 +2043,6 @@ def approval_message(job, analysis=None, include_state=False):
     findings, auto, total = _collect_review(job, analysis)
     meta = metadata()
     remote_address = str(meta.get("remoteAddress") or "未知主机")
-    session_path = str(meta.get("sessionPath") or "")
-    host_line = "目标主机：" + remote_address
-    if session_path:
-        host_line += "　会话：" + session_path
     if action.get("type") == "send":
         operation = "发送终端输入" + ("并按回车" if action.get("enter", False) else "（不按回车）")
         raw_input = str(action.get("text", ""))
@@ -2057,28 +2053,9 @@ def approval_message(job, analysis=None, include_state=False):
         operation = "发送 Ctrl+C 中断当前命令"
         shown_input = "Ctrl+C"
         shown_findings = []
-    header = [host_line, "确认原因：" + CONFIRMATION_REASONS[confirmation_reason(job, analysis)], ""]
-    if findings:
-        header.append("⚠ 需要你重点确认：" + str(total) + " 处")
-        header.append("────────────────────────────")
-        for order, finding in enumerate(shown_findings, 1):
-            header.append("%d) 规则：%s" % (order, finding.get("category")))
-            header.append("   片段：" + _snippet(finding))
-            target = finding.get("target")
-            header.append("   对象：" + str(target or "未确定，请核对命令"))
-            impact = finding.get("impact") or _impact_for(finding.get("category"))
-            header.append("   后果：" + str(impact))
-        if total > len(shown_findings):
-            header.append("…… 另有 %d 处" % (total - len(shown_findings)))
-        header.append("────────────────────────────")
-        if auto:
-            header.append("另有 %d 处命令替换未单独列入上表。" % len(auto))
-        header.append("")
-    elif auto:
-        header.append("命令含 %d 处命令替换，解析后未发现需要重点确认的命中。" % len(auto))
-        header.append("")
-    command_label = "命令（【】内为需要确认的片段；长命令只展示命中行及其相邻一行）：" if action.get("type") == "send" else "输入："
-    message = "\n".join(header) + "\n" + "\n".join([
+    reason = CONFIRMATION_REASONS[confirmation_reason(job, analysis)]
+    lines = [
+        "目标主机：" + remote_address,
         "Agent：" + str(job.get("agentId", "unknown-agent")),
         "操作：" + operation,
         "风险等级：" + RISK_LABELS.get(str(action.get("riskLevel", "")), "未说明"),
@@ -2089,14 +2066,26 @@ def approval_message(job, analysis=None, include_state=False):
         "预期结果：",
         _clip(action.get("expectedOutcome", ""), DIALOG_FIELD_LIMIT),
         "",
-        command_label,
-        "---",
-        shown_input,
-        "---",
-        "",
-        "只有在你理解并同意以上内容时才点击“是”。点击“否”不会向服务器发送任何内容。",
-    ])
-    message = _escape_controls(_fit_message(message))
+        "确认原因：" + reason,
+    ]
+    if findings:
+        lines.append("需要重点确认：" + str(total) + " 处")
+        lines.append("────────────────────────────")
+        for order, finding in enumerate(shown_findings, 1):
+            lines.append("%d) 规则：%s" % (order, finding.get("category")))
+            lines.append("   片段：" + _snippet(finding))
+            target = finding.get("target")
+            lines.append("   对象：" + str(target or "未确定，请核对命令"))
+            impact = finding.get("impact") or _impact_for(finding.get("category"))
+            lines.append("   后果：" + str(impact))
+        if total > len(shown_findings):
+            lines.append("…… 另有 %d 处" % (total - len(shown_findings)))
+        lines.append("────────────────────────────")
+    elif auto:
+        lines.append("命令含 %d 处命令替换，解析后未发现需要重点确认的命中。" % len(auto))
+    command_label = "命令（【】内为需要确认的片段；长命令只展示命中行及其相邻一行）：" if action.get("type") == "send" else "输入："
+    lines.extend(["", command_label, "---", shown_input, "---"])
+    message = _escape_controls(_fit_message("\n".join(lines)))
     excerpted = action.get("type") == "send" and (_excerpt(marked) != marked or message.find("\n---\n" + shown_input + "\n---\n") < 0)
     return (message, excerpted) if include_state else message
 
@@ -2109,7 +2098,7 @@ def request_user_approval(job, analysis=None):
             return int(xsh.Dialog.MessageBox(message, title, 4)) == 6
         # Yes opens the full input, No rejects, Cancel rejects. Approval is
         # requested only on the final page to keep every dismissal fail-closed.
-        message = message.rsplit("\n", 1)[0] + "\n是：查看完整输入后确认。否：拒绝。"
+        message = message + "\n\n是：查看完整输入后确认。否：拒绝。"
         if int(xsh.Dialog.MessageBox(message, title, 4)) != 6:
             return False
         remaining = _escape_controls(job["action"]["text"])
