@@ -159,7 +159,7 @@ def capture_screen():
     columns = int(safe_value(lambda: xsh.Screen.Columns, 0) or 0)
     if rows < 1 or columns < 1:
         return ""
-    return str(xsh.Screen.Get(1, 1, rows, columns))
+    return str(safe_value(lambda: xsh.Screen.Get(1, 1, rows, columns), ""))
 
 
 def invalidate_screen_cache():
@@ -2172,9 +2172,15 @@ def execute_job(job):
 
         pre_screen = capture_screen()
         if action_type == "send":
-            xsh.Screen.Send(action.get("text", ""))
-            if action.get("enter", False):
-                xsh.Screen.Send("\r")
+            # Synchronous 会暂停终端输出并把 UI 线程和脚本绑在一起，
+            # 只在真正发送时开启，发完立刻还原，避免长时间挂机时拖住界面。
+            xsh.Screen.Synchronous = True
+            try:
+                xsh.Screen.Send(action.get("text", ""))
+                if action.get("enter", False):
+                    xsh.Screen.Send("\r")
+            finally:
+                xsh.Screen.Synchronous = False
         else:
             xsh.Screen.Send(chr(3))
         result["acceptedByXshell"] = True
@@ -2342,7 +2348,6 @@ def note_step(name):
 
 def _main_loop():
     global LAST_ACTIVITY_AT
-    xsh.Screen.Synchronous = True
     os.makedirs(SESSION_DIR, exist_ok=True)
     os.makedirs(DESKTOP_LAUNCH_ROOT, exist_ok=True)
     write_state()
