@@ -2130,49 +2130,6 @@ def hard_blocked_operation(text):
     return analyze_command(text)["category"]
 
 
-SQL_LITERAL_RE = re.compile(r"'([^']*)'")
-SQL_PROMPT_RE = re.compile(r"(?i)(?:SQL|mysql|mariadb)\s*>\s*$")
-AUTO_ESCAPE = bool(CONFIG.get("bridge", {}).get("autoEscapeNonAscii", True))
-
-
-def has_non_ascii(text):
-    return any(ord(ch) > 127 for ch in text)
-
-
-def escape_sql_literals(text):
-    """把 SQL 中含中文的字面量改写成 unistr 形式（参数为纯 ASCII 码点）。"""
-    def replace(match):
-        body = match.group(1)
-        if not has_non_ascii(body):
-            return match.group(0)
-        return "unistr('%s')" % "".join("\\%04X" % ord(ch) for ch in body)
-    return SQL_LITERAL_RE.sub(replace, text)
-
-
-def escape_shell_text(text):
-    """把 shell 命令中的中文改写成 printf 的八进制转义形式。"""
-    parts = []
-    for ch in text:
-        if ord(ch) > 127:
-            octal = "".join("\\%03o" % byte for byte in ch.encode("utf-8"))
-            parts.append("$(printf '%s')" % octal)
-        else:
-            parts.append(ch)
-    return "".join(parts)
-
-
-def escape_for_send(text, pre_screen):
-    if not AUTO_ESCAPE or not has_non_ascii(text):
-        return text
-    tail = last_nonempty_line(pre_screen).strip()
-    if SQL_PROMPT_RE.search(tail):
-        return escape_sql_literals(text)
-    if text.count("'") % 2 == 1:
-        record_loop_error("auto_escape", "单引号不成对，跳过中文转义")
-        return text
-    return escape_shell_text(text)
-
-
 def execute_job(job):
     action = job.get("action", {})
     result = {"acceptedByXshell": False, "confirmationShown": False, "approvedByUser": False}
@@ -2215,7 +2172,7 @@ def execute_job(job):
 
         pre_screen = capture_screen()
         if action_type == "send":
-            xsh.Screen.Send(escape_for_send(action.get("text", ""), pre_screen))
+            xsh.Screen.Send(action.get("text", ""))
             if action.get("enter", False):
                 xsh.Screen.Send("\r")
         else:
