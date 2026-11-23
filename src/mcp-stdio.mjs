@@ -14,7 +14,7 @@ const SEND_POLICY = {
   full: 'full 模式下，终端输入跳过危险命令检查和 Xshell 本地弹窗，发送前仍须获得用户对操作的明确授权。',
 }[SAFETY_MODE];
 const INTERRUPT_POLICY = SAFETY_MODE === 'full' ? '直接发送 Ctrl+C。' : 'Xshell 会弹窗确认 Ctrl+C。';
-const RESULT_POLICY = '发送后最多等 3 秒看提示符；promptDetected=false 表示可能未结束，先 read_screen 复核再发下一条。中文可直接发送，脚本会自动转义。尽量用非交互式写法。';
+const RESULT_POLICY = '发送后最多等 3 秒看提示符；promptDetected=false 表示可能未结束，先 read_screen 复核再发下一条。含中文的内容必须由你先转成 ASCII 再发送：Xshell 的 Send 会破坏非 ASCII（读屏正常，只影响发送）。写法：Oracle 用 unistr 包四位十六进制码点，MySQL 用 CONVERT(0x 十六进制 USING utf8mb4)，shell 与 redis 用 printf 八进制转义；可用 python tools.py esc 中文 生成具体写法。纯 ASCII 命令不受影响。';
 const PROTOCOL_VERSION = '2025-06-18';
 const downloadManager = new SftpDownloadManager();
 const uploadManager = new SftpUploadManager();
