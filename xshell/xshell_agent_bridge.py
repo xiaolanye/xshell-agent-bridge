@@ -64,15 +64,23 @@ CACHED_AT = 0.0
 
 def atomic_write_json(path, value):
     temporary = path + "." + os.urandom(4).hex() + ".tmp"
-    with open(temporary, "w", encoding="utf-8") as handle:
-        json.dump(value, handle, ensure_ascii=False)
+    # 显式按 UTF-8 字节写入：Xshell 内置 Python 的 open(encoding=...) 不可靠。
+    payload = json.dumps(value, ensure_ascii=False).encode("utf-8")
+    with open(temporary, "wb") as handle:
+        handle.write(payload)
         handle.flush()
     os.replace(temporary, path)
 
 
 def read_json(path):
-    with open(path, "r", encoding="utf-8") as handle:
-        return json.load(handle)
+    # 显式按字节读取再解码：同样为了绕开 open(encoding=...) 的行为差异。
+    with open(path, "rb") as handle:
+        raw = handle.read()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("gbk", "replace")
+    return json.loads(text)
 
 
 def record_loop_error(stage, error):
@@ -2122,6 +2130,49 @@ def hard_blocked_operation(text):
     return analyze_command(text)["category"]
 
 
+SQL_LITERAL_RE = re.compile(r"'([^']*)'")
+SQL_PROMPT_RE = re.compile(r"(?i)(?:SQL|mysql|mariadb)\s*>\s*$")
+AUTO_ESCAPE = bool(CONFIG.get("bridge", {}).get("autoEscapeNonAscii", True))
+
+
+def has_non_ascii(text):
+    return any(ord(ch) > 127 for ch in text)
+
+
+def escape_sql_literals(text):
+    """把 SQL 中含中文的字面量改写成 unistr 形式（参数为纯 ASCII 码点）。"""
+    def replace(match):
+        body = match.group(1)
+        if not has_non_ascii(body):
+            return match.group(0)
+        return "unistr('%s')" % "".join("\\%04X" % ord(ch) for ch in body)
+    return SQL_LITERAL_RE.sub(replace, text)
+
+
+def escape_shell_text(text):
+    """把 shell 命令中的中文改写成 printf 的八进制转义形式。"""
+    parts = []
+    for ch in text:
+        if ord(ch) > 127:
+            octal = "".join("\\%03o" % byte for byte in ch.encode("utf-8"))
+            parts.append("$(printf '%s')" % octal)
+        else:
+            parts.append(ch)
+    return "".join(parts)
+
+
+def escape_for_send(text, pre_screen):
+    if not AUTO_ESCAPE or not has_non_ascii(text):
+        return text
+    tail = last_nonempty_line(pre_screen).strip()
+    if SQL_PROMPT_RE.search(tail):
+        return escape_sql_literals(text)
+    if text.count("'") % 2 == 1:
+        record_loop_error("auto_escape", "单引号不成对，跳过中文转义")
+        return text
+    return escape_shell_text(text)
+
+
 def execute_job(job):
     action = job.get("action", {})
     result = {"acceptedByXshell": False, "confirmationShown": False, "approvedByUser": False}
@@ -2164,12 +2215,16 @@ def execute_job(job):
 
         pre_screen = capture_screen()
         if action_type == "send":
-            xsh.Screen.Send(action.get("text", ""))
+            xsh.Screen.Send(escape_for_send(action.get("text", ""), pre_screen))
             if action.get("enter", False):
                 xsh.Screen.Send("\r")
         else:
             xsh.Screen.Send(chr(3))
         result["acceptedByXshell"] = True
+        # 自证字段：脚本实际持有的文本按 UTF-8 转 hex。
+        # 若中文被读错，这里会直接体现（例如“甲乙丙”应为 e794b2e4b999e4b899）。
+        if action_type == "send":
+            result["textBytes"] = action.get("text", "").encode("utf-8", "replace").hex()[:120]
         # 给回显和首批输出一点时间落到屏幕上，再让主循环抓新图。
         if SETTLE_MS > 0:
             try:
